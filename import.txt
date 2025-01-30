@@ -13,11 +13,20 @@ def parse_state_file(state_file):
     resource_map = {}
     
     for resource in resources:
-        for instance in resource.get("instances", []):
+        if resource["mode"] == "data":  # Skip data resources
+            continue
+        
+        for instance_index, instance in enumerate(resource.get("instances", [])):
             if "module" in resource:
-                address = "module." + resource.get("module", "") + "." + resource["mode"] + "." + resource["type"] + "." + resource["name"]
+                address = f"module.{resource.get('module', '')}.{resource['mode']}.{resource['type']}.{resource['name']}"
             else:
-                address = resource["mode"] + "." + resource["type"] + "." + resource["name"]
+                address = f"{resource['mode']}.{resource['type']}.{resource['name']}"
+            
+            # Handle indexed resources
+            if "index_key" in instance:
+                address += f"[{instance['index_key']}]"
+            elif len(resource["instances"]) > 1:
+                address += f"[{instance_index}]"
             
             resource_map[address] = instance.get("attributes", {}).get("id", None)
             for dep in instance.get("dependencies", []):
