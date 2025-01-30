@@ -1,7 +1,7 @@
 import json
 import subprocess
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 
 def parse_state_file(state_file):
     with open(state_file, 'r') as f:
@@ -9,6 +9,7 @@ def parse_state_file(state_file):
     
     resources = state.get("resources", [])
     dependencies = defaultdict(set)
+    reverse_dependencies = defaultdict(set)
     resource_map = {}
     
     for resource in resources:
@@ -21,26 +22,31 @@ def parse_state_file(state_file):
             resource_map[address] = instance.get("attributes", {}).get("id", None)
             for dep in instance.get("dependencies", []):
                 dependencies[address].add(dep)
+                reverse_dependencies[dep].add(address)
     
-    return resource_map, dependencies
+    return resource_map, dependencies, reverse_dependencies
 
-def topological_sort(resources, dependencies):
+def topological_sort(resources, dependencies, reverse_dependencies):
     sorted_resources = []
-    while resources:
-        independent = [r for r in resources if not dependencies[r]]
-        if not independent:
-            raise Exception("Circular dependency detected in Terraform state file!")
-        for r in independent:
-            sorted_resources.append(r)
-            del resources[r]
-            for deps in dependencies.values():
-                deps.discard(r)
+    independent = deque([r for r in resources if not dependencies[r]])
+    
+    while independent:
+        r = independent.popleft()
+        sorted_resources.append(r)
+        for dep in reverse_dependencies[r]:
+            dependencies[dep].discard(r)
+            if not dependencies[dep]:
+                independent.append(dep)
+        del resources[r]
+    
+    if resources:
+        raise Exception("Circular dependency detected in Terraform state file!")
     
     return sorted_resources
 
 def import_resources(state_file):
-    resource_map, dependencies = parse_state_file(state_file)
-    sorted_resources = topological_sort(resource_map.copy(), dependencies.copy())
+    resource_map, dependencies, reverse_dependencies = parse_state_file(state_file)
+    sorted_resources = topological_sort(resource_map.copy(), dependencies.copy(), reverse_dependencies.copy())
     
     for resource in sorted_resources:
         resource_id = resource_map[resource]
