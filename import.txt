@@ -22,17 +22,16 @@ def parse_state_file(state_file):
             else:
                 address = f"{resource['mode']}.{resource['type']}.{resource['name']}"
             
-            # Handle indexed resources
+            # Ensure resource instance key is correctly enclosed in square brackets
             if "index_key" in instance:
-                address += f"[{instance['index_key']}]"
+                address += f"[\"{instance['index_key']}\"]"  # Ensure correct string format for keys
             elif len(resource["instances"]) > 1:
                 address += f"[{instance_index}]"
             
             resource_map[address] = instance.get("attributes", {}).get("id", None)
             for dep in instance.get("dependencies", []):
-                if dep in resource_map:  # Ensure the dependency exists before adding
-                    dependencies[address].add(dep)
-                    reverse_dependencies[dep].add(address)
+                dependencies[address].add(dep)
+                reverse_dependencies[dep].add(address)
     
     return resource_map, dependencies, reverse_dependencies
 
@@ -59,7 +58,7 @@ def import_resources(state_file):
     for resource in sorted_resources:
         resource_id = resource_map.get(resource)
         if resource_id:
-            cmd = f"terraform import {resource} {resource_id}"
+            cmd = f"terraform import '{resource}' '{resource_id}'"
             print(f"Executing: {cmd}")
             subprocess.run(cmd, shell=True)
             time.sleep(1)  # Prevent rate limiting or API throttling
