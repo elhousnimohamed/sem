@@ -15,32 +15,31 @@ def parse_state_file(state_file):
     for resource in resources:
         for instance in resource.get("instances", []):
             if "module" in resource:
-                address = "module." + resource["module"] + "." + resource["mode"] + "." + resource["type"] + "." + resource["name"]
+                address = "module." + resource.get("module", "") + "." + resource["mode"] + "." + resource["type"] + "." + resource["name"]
             else:
                 address = resource["mode"] + "." + resource["type"] + "." + resource["name"]
             
             resource_map[address] = instance.get("attributes", {}).get("id", None)
             for dep in instance.get("dependencies", []):
-                dependencies[address].add(dep)
-                reverse_dependencies[dep].add(address)
+                if dep in resource_map:  # Ensure the dependency exists before adding
+                    dependencies[address].add(dep)
+                    reverse_dependencies[dep].add(address)
     
     return resource_map, dependencies, reverse_dependencies
 
 def topological_sort(resources, dependencies, reverse_dependencies):
     sorted_resources = []
-    independent = deque([r for r in resources if not dependencies[r]])
+    independent = deque([r for r in resources if r not in dependencies or not dependencies[r]])
     
     while independent:
         r = independent.popleft()
         sorted_resources.append(r)
-        for dep in reverse_dependencies[r]:
+        for dep in list(reverse_dependencies[r]):  # Avoid modifying dict during iteration
             dependencies[dep].discard(r)
+            reverse_dependencies[r].discard(dep)
             if not dependencies[dep]:
                 independent.append(dep)
         del resources[r]
-    
-    if resources:
-        raise Exception("Circular dependency detected in Terraform state file!")
     
     return sorted_resources
 
@@ -49,7 +48,7 @@ def import_resources(state_file):
     sorted_resources = topological_sort(resource_map.copy(), dependencies.copy(), reverse_dependencies.copy())
     
     for resource in sorted_resources:
-        resource_id = resource_map[resource]
+        resource_id = resource_map.get(resource)
         if resource_id:
             cmd = f"terraform import {resource} {resource_id}"
             print(f"Executing: {cmd}")
