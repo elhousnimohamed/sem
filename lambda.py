@@ -10,26 +10,57 @@ def lambda_handler(event, context):
     invoking_event = json.loads(event['invokingEvent'])
     rule_parameters = json.loads(event.get('ruleParameters', '{}'))
     
+    # Extract parameters with defaults
+    excluded_users = rule_parameters.get('ExcludedUsers', '').split(',')
+    excluded_users = [user.strip() for user in excluded_users if user.strip()]
+    
     # Check if this is a scheduled notification or a configuration change
     if invoking_event['messageType'] == 'ScheduledNotification':
-        return evaluate_compliance_scheduled(iam, rule_parameters)
+        return evaluate_compliance_scheduled(iam, excluded_users, event)
     else:
         configuration_item = invoking_event.get('configurationItem', {})
-        return evaluate_compliance_change(iam, configuration_item, rule_parameters)
+        return evaluate_compliance_change(iam, configuration_item, excluded_users, event)
 
-def evaluate_compliance_change(iam, configuration_item, rule_parameters):
+def evaluate_compliance_change(iam, configuration_item, excluded_users, event):
     """Evaluate compliance based on a configuration change."""
     # Check if we're dealing with an IAM user resource
     if configuration_item['resourceType'] != 'AWS::IAM::User':
-        return {
-            'compliance_type': 'NOT_APPLICABLE',
-            'annotation': 'Resource is not an IAM User'
+        evaluation = {
+            'ComplianceResourceType': configuration_item['resourceType'],
+            'ComplianceResourceId': configuration_item['resourceId'],
+            'ComplianceType': 'NOT_APPLICABLE',
+            'Annotation': 'Resource is not an IAM User',
+            'OrderingTimestamp': configuration_item['configurationItemCaptureTime']
         }
+        
+        config = boto3.client('config')
+        config.put_evaluations(
+            Evaluations=[evaluation],
+            ResultToken=event['resultToken']
+        )
+        
+        return [evaluation]
     
     user_name = configuration_item['resourceName']
-    return check_user_compliance(iam, user_name)
+    compliance_result = check_user_compliance(iam, user_name, excluded_users)
+    
+    evaluation = {
+        'ComplianceResourceType': configuration_item['resourceType'],
+        'ComplianceResourceId': configuration_item['resourceId'],
+        'ComplianceType': compliance_result['compliance_type'],
+        'Annotation': compliance_result['annotation'],
+        'OrderingTimestamp': configuration_item['configurationItemCaptureTime']
+    }
+    
+    config = boto3.client('config')
+    config.put_evaluations(
+        Evaluations=[evaluation],
+        ResultToken=event['resultToken']
+    )
+    
+    return [evaluation]
 
-def evaluate_compliance_scheduled(iam, rule_parameters):
+def evaluate_compliance_scheduled(iam, excluded_users, event):
     """Evaluate compliance for all IAM users."""
     # Get all IAM users
     all_users = []
@@ -51,7 +82,7 @@ def evaluate_compliance_scheduled(iam, rule_parameters):
     # Check compliance for each user
     evaluations = []
     for user in all_users:
-        compliance_result = check_user_compliance(iam, user['UserName'])
+        compliance_result = check_user_compliance(iam, user['UserName'], excluded_users)
         evaluations.append({
             'ComplianceResourceType': 'AWS::IAM::User',
             'ComplianceResourceId': user['UserName'],
@@ -61,18 +92,23 @@ def evaluate_compliance_scheduled(iam, rule_parameters):
         })
     
     # Return the evaluation results
-    put_evaluations_request = {
-        'Evaluations': evaluations,
-        'ResultToken': event['resultToken']
-    }
-    
     config = boto3.client('config')
-    config.put_evaluations(**put_evaluations_request)
+    config.put_evaluations(
+        Evaluations=evaluations,
+        ResultToken=event['resultToken']
+    )
     
     return evaluations
 
-def check_user_compliance(iam, user_name):
+def check_user_compliance(iam, user_name, excluded_users):
     """Check if an IAM user has a console password."""
+    # Check if the user is in the excluded list
+    if user_name in excluded_users:
+        return {
+            'compliance_type': 'COMPLIANT',
+            'annotation': f'IAM user {user_name} is excluded from this rule'
+        }
+    
     try:
         # Check if the user has a password
         response = iam.get_login_profile(UserName=user_name)
