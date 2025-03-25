@@ -59,3 +59,10 @@ func ConfirmAction(actionDescription string) bool {
     response, _ := reader.ReadString('\n')
     return strings.TrimSpace(response) == "CONFIRM"
 }
+
+
+// Confirm destructive action
+    if !utils.ConfirmAction(fmt.Sprintf("You are about to PERMANENTLY DELETE IAM user: %s", username)) {
+        fmt.Println("Deletion cancelled by user")
+        return nil
+    }
