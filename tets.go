@@ -41,6 +41,8 @@ Run: func(cmd *cobra.Command, args []string) {
 
 		fmt.Printf("Successfully remediated resource %s\n", resourceID)
 	},
+
+
 package utils
 
 import (
@@ -50,24 +52,10 @@ import (
     "strings"
 )
 
-func AskForConfirmation(prompt string) bool {
+func ConfirmAction(actionDescription string) bool {
     reader := bufio.NewReader(os.Stdin)
+    fmt.Printf("\nWARNING: %s\nType 'CONFIRM' to proceed: ", actionDescription)
     
-    for {
-        fmt.Printf("%s [y/N]: ", prompt)
-        response, err := reader.ReadString('\n')
-        if err != nil {
-            return false
-        }
-
-        response = strings.TrimSpace(strings.ToLower(response))
-        if response == "y" || response == "yes" {
-            return true
-        }
-        if response == "" || response == "n" || response == "no" {
-            return false
-        }
-        
-        fmt.Println("Please type 'y' or 'n' and press enter")
-    }
+    response, _ := reader.ReadString('\n')
+    return strings.TrimSpace(response) == "CONFIRM"
 }
