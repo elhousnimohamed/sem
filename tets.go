@@ -151,4 +151,42 @@ func ExampleIAMUserManagement() {
 		return
 	}
 	fmt.Printf("Removed console access for user %s\n", username)
+	
 }
+
+
+-------------------
+package cmd
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/cobra/doc"
+)
+
+// docsCmd represents the docs command
+var docsCmd = &cobra.Command{
+	Use:   "docs",
+	Short: "Generate documentation for the CLI",
+	Run: func(cmd *cobra.Command, args []string) {
+		err := os.MkdirAll("docs", 0755) // Ensure the directory exists
+		if err != nil {
+			fmt.Println("Error creating docs directory:", err)
+			return
+		}
+
+		err = doc.GenMarkdownTree(rootCmd, "docs")
+		if err != nil {
+			fmt.Println("Error generating documentation:", err)
+		} else {
+			fmt.Println("Documentation generated successfully in ./docs/")
+		}
+	},
+}
+
+func init() {
+	rootCmd.AddCommand(docsCmd)
+}
+
