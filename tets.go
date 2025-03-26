@@ -66,3 +66,89 @@ func ConfirmAction(actionDescription string) bool {
         fmt.Println("Deletion cancelled by user")
         return nil
     }
+-----------------------------------------------------
+package iammanagement
+
+import (
+	"fmt"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/iam/types"
+)
+
+// CheckUserConsoleAccess checks if an IAM user exists and has console access
+func CheckUserConsoleAccess(username string) (bool, error) {
+	// Load AWS configuration
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return false, fmt.Errorf("failed to load AWS configuration: %v", err)
+	}
+
+	// Create IAM client
+	iamClient := iam.NewFromConfig(cfg)
+
+	// Check if user exists
+	_, err = iamClient.GetUser(context.TODO(), &iam.GetUserInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to get user %s: %v", username, err)
+	}
+
+	// Get login profile to check console access
+	_, err = iamClient.GetLoginProfile(context.TODO(), &iam.GetLoginProfileInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		// If GetLoginProfile returns an error, the user doesn't have console access
+		return false, nil
+	}
+
+	// User exists and has console access
+	return true, nil
+}
+
+// RemoveUserConsoleAccess removes console access for an IAM user
+func RemoveUserConsoleAccess(username string) error {
+	// Load AWS configuration
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return fmt.Errorf("failed to load AWS configuration: %v", err)
+	}
+
+	// Create IAM client
+	iamClient := iam.NewFromConfig(cfg)
+
+	// Delete login profile to remove console access
+	_, err = iamClient.DeleteLoginProfile(context.TODO(), &iam.DeleteLoginProfileInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to remove console access for user %s: %v", username, err)
+	}
+
+	return nil
+}
+
+// Example usage
+func ExampleIAMUserManagement() {
+	username := "example-user"
+
+	// Check if user has console access
+	hasConsoleAccess, err := CheckUserConsoleAccess(username)
+	if err != nil {
+		fmt.Printf("Error checking user console access: %v\n", err)
+		return
+	}
+	fmt.Printf("User %s console access: %v\n", username, hasConsoleAccess)
+
+	// Remove console access
+	err = RemoveUserConsoleAccess(username)
+	if err != nil {
+		fmt.Printf("Error removing console access: %v\n", err)
+		return
+	}
+	fmt.Printf("Removed console access for user %s\n", username)
+}
