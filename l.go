@@ -66,3 +66,22 @@ func certificateExists(ctx context.Context, client *iam.Client, identifier strin
 
 	return false, nil
 }
+
+
+
+func certificateExists(ctx context.Context, client *iam.Client, name string) (bool, error) {
+	_, err := client.GetServerCertificate(ctx, &iam.GetServerCertificateInput{
+		ServerCertificateName: aws.String(name),
+	})
+
+	if err == nil {
+		return true, nil // Certificate exists
+	}
+
+	var notFoundErr *types.NoSuchEntityException
+	if errors.As(err, &notFoundErr) {
+		return false, nil // Certificate doesn't exist
+	}
+
+	return false, err // Other error occurred
+}
