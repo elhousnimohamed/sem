@@ -336,3 +336,30 @@ func downloadNewCredentials(newCredentials *types.CreateAccessKeyOutput, userNam
 	fmt.Printf("New credentials downloaded to %s\n", filename)
 	return nil
 }
+
+func (c *IAMClient) rotateAccessKey(ctx context.Context, username, oldKeyID string) error {
+	// Create new key
+	newKey, err := c.createAccessKey(ctx, username)
+	if err != nil {
+		return err
+	}
+
+	// Write new key credentials to file
+	filename := fmt.Sprintf("%s_new_credentials.txt", username)
+	content := fmt.Sprintf("Access Key ID: %s\nSecret Access Key: %s\n", *newKey.AccessKeyId, *newKey.SecretAccessKey)
+	err = os.WriteFile(filename, []byte(content), 0600)
+	if err != nil {
+		return fmt.Errorf("failed to save new credentials to file: %v", err)
+	}
+	fmt.Printf("New credentials saved to %s (KEEP THIS SECURE!)\n", filename)
+
+	// Delete old key
+	err = c.deleteAccessKey(ctx, username, oldKeyID)
+	if err != nil {
+		fmt.Printf("WARNING: Created new key but failed to delete old key %s. Manual cleanup required.\n", oldKeyID)
+		return err
+	}
+
+	return nil
+}
+
