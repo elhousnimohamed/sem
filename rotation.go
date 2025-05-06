@@ -363,3 +363,13 @@ func (c *IAMClient) rotateAccessKey(ctx context.Context, username, oldKeyID stri
 	return nil
 }
 
+func (c *IAMClient) createAccessKey(ctx context.Context, username string) (*types.AccessKey, error) {
+	result, err := c.client.CreateAccessKey(ctx, &iam.CreateAccessKeyInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create new access key for user %s: %v", username, err)
+	}
+	fmt.Printf("Created new access key for user %s: %s\n", username, *result.AccessKey.AccessKeyId)
+	return result.AccessKey, nil
+}
