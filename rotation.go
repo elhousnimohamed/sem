@@ -373,3 +373,14 @@ func (c *IAMClient) createAccessKey(ctx context.Context, username string) (*type
 	fmt.Printf("Created new access key for user %s: %s\n", username, *result.AccessKey.AccessKeyId)
 	return result.AccessKey, nil
 }
+func (c *IAMClient) deleteAccessKey(ctx context.Context, username, accessKeyID string) error {
+	_, err := c.client.DeleteAccessKey(ctx, &iam.DeleteAccessKeyInput{
+		UserName:    aws.String(username),
+		AccessKeyId: aws.String(accessKeyID),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete access key %s for user %s: %v", accessKeyID, username, err)
+	}
+	fmt.Printf("Deleted unused access key %s for user %s\n", accessKeyID, username)
+	return nil
+}
