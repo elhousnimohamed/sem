@@ -384,3 +384,307 @@ func (c *IAMClient) deleteAccessKey(ctx context.Context, username, accessKeyID s
 	fmt.Printf("Deleted unused access key %s for user %s\n", accessKeyID, username)
 	return nil
 }
+
+-----------------------------------------------------------------------------------------
+package main
+
+import (
+	"context"
+	"encoding/csv"
+	"flag"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/iam/types"
+)
+
+type IAMClient struct {
+	client *iam.Client
+}
+
+func NewIAMClient() (*IAMClient, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS configuration: %v", err)
+	}
+
+	return &IAMClient{
+		client: iam.NewFromConfig(cfg),
+	}, nil
+}
+
+func (c *IAMClient) generateCredentialReport(ctx context.Context) error {
+	// Start credential report generation
+	_, err := c.client.GenerateCredentialReport(ctx, &iam.GenerateCredentialReportInput{})
+	if err != nil {
+		return fmt.Errorf("failed to generate credential report: %v", err)
+	}
+
+	// Wait for report to complete
+	for {
+		output, err := c.client.GetCredentialReport(ctx, &iam.GetCredentialReportInput{})
+		if err != nil {
+			return fmt.Errorf("failed to get credential report status: %v", err)
+		}
+
+		if output.ReportFormat == types.ReportFormatCsv && output.GeneratedTime != nil {
+			// Report is ready
+			return nil
+		}
+
+		// Wait a bit before checking again
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func (c *IAMClient) saveCredentialReport(ctx context.Context, filename string) error {
+	// Generate or update the credential report
+	if err := c.generateCredentialReport(ctx); err != nil {
+		return err
+	}
+
+	// Fetch the credential report
+	output, err := c.client.GetCredentialReport(ctx, &iam.GetCredentialReportInput{})
+	if err != nil {
+		return fmt.Errorf("failed to fetch credential report: %v", err)
+	}
+
+	// Save the report to a file
+	err = os.WriteFile(filename, output.Content, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to save credential report: %v", err)
+	}
+
+	fmt.Printf("Credential report saved to %s\n", filename)
+	return nil
+}
+
+func (c *IAMClient) getUsernameFromARN(arn string) string {
+	// Extract username from ARN format: arn:aws:iam::ACCOUNT_ID:user/USERNAME
+	parts := strings.Split(arn, "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-1]
+}
+
+func (c *IAMClient) getUser(ctx context.Context, username string) (*types.User, error) {
+	output, err := c.client.GetUser(ctx, &iam.GetUserInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user %s: %v", username, err)
+	}
+	return output.User, nil
+}
+
+func (c *IAMClient) getAccessKeys(ctx context.Context, username string) ([]types.AccessKeyMetadata, error) {
+	output, err := c.client.ListAccessKeys(ctx, &iam.ListAccessKeysInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list access keys for user %s: %v", username, err)
+	}
+	return output.AccessKeyMetadata, nil
+}
+
+func (c *IAMClient) getAccessKeyLastUsed(ctx context.Context, accessKeyID string) (*iam.GetAccessKeyLastUsedOutput, error) {
+	output, err := c.client.GetAccessKeyLastUsed(ctx, &iam.GetAccessKeyLastUsedInput{
+		AccessKeyId: aws.String(accessKeyID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get access key last used info for key %s: %v", accessKeyID, err)
+	}
+	return output, nil
+}
+
+func (c *IAMClient) deleteAccessKey(ctx context.Context, username, accessKeyID string) error {
+	_, err := c.client.DeleteAccessKey(ctx, &iam.DeleteAccessKeyInput{
+		UserName:    aws.String(username),
+		AccessKeyId: aws.String(accessKeyID),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete access key %s for user %s: %v", accessKeyID, username, err)
+	}
+	fmt.Printf("Deleted unused access key %s for user %s\n", accessKeyID, username)
+	return nil
+}
+
+func (c *IAMClient) createAccessKey(ctx context.Context, username string) (*types.AccessKey, error) {
+	result, err := c.client.CreateAccessKey(ctx, &iam.CreateAccessKeyInput{
+		UserName: aws.String(username),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create new access key for user %s: %v", username, err)
+	}
+	fmt.Printf("Created new access key for user %s: %s\n", username, *result.AccessKey.AccessKeyId)
+	return result.AccessKey, nil
+}
+
+func (c *IAMClient) rotateAccessKey(ctx context.Context, username, oldKeyID string) error {
+	// Create new key
+	newKey, err := c.createAccessKey(ctx, username)
+	if err != nil {
+		return err
+	}
+
+	// Write new key credentials to file
+	filename := fmt.Sprintf("%s_new_credentials.txt", username)
+	content := fmt.Sprintf("Access Key ID: %s\nSecret Access Key: %s\n", *newKey.AccessKeyId, *newKey.SecretAccessKey)
+	err = os.WriteFile(filename, []byte(content), 0600)
+	if err != nil {
+		return fmt.Errorf("failed to save new credentials to file: %v", err)
+	}
+	fmt.Printf("New credentials saved to %s (KEEP THIS SECURE!)\n", filename)
+
+	// Delete old key
+	err = c.deleteAccessKey(ctx, username, oldKeyID)
+	if err != nil {
+		fmt.Printf("WARNING: Created new key but failed to delete old key %s. Manual cleanup required.\n", oldKeyID)
+		return err
+	}
+
+	return nil
+}
+
+// processUser handles the key management logic for a specific IAM user
+func processUser(ctx context.Context, iamClient *IAMClient, userARN string) error {
+	username := iamClient.getUsernameFromARN(userARN)
+	if username == "" {
+		return fmt.Errorf("invalid IAM user ARN: %s", userARN)
+	}
+
+	fmt.Printf("Processing IAM user: %s\n", username)
+
+	// Verify the user exists and get user details
+	user, err := iamClient.getUser(ctx, username)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Found user: %s (ARN: %s)\n", *user.UserName, *user.Arn)
+
+	// Get user's access keys directly from the IAM API
+	accessKeys, err := iamClient.getAccessKeys(ctx, username)
+	if err != nil {
+		return err
+	}
+
+	if len(accessKeys) == 0 {
+		fmt.Printf("User %s has no access keys. No action necessary.\n", username)
+		return nil
+	}
+
+	fmt.Printf("Found %d access keys for user %s\n", len(accessKeys), username)
+
+	// Process each access key
+	keyRotated := false
+	for _, keyMetadata := range accessKeys {
+		if keyMetadata.AccessKeyId == nil {
+			continue
+		}
+		
+		keyID := *keyMetadata.AccessKeyId
+		fmt.Printf("Processing access key: %s\n", keyID)
+		
+		// Check if key is active
+		if keyMetadata.Status != types.StatusTypeActive {
+			fmt.Printf("Access key %s is not active (status: %s). Skipping.\n", keyID, keyMetadata.Status)
+			continue
+		}
+		
+		// Get last used information
+		lastUsedInfo, err := iamClient.getAccessKeyLastUsed(ctx, keyID)
+		if err != nil {
+			return err
+		}
+		
+		// Check if key has ever been used
+		keyNeverUsed := lastUsedInfo.AccessKeyLastUsed == nil || 
+			lastUsedInfo.AccessKeyLastUsed.LastUsedDate == nil ||
+			lastUsedInfo.AccessKeyLastUsed.ServiceName == nil ||
+			*lastUsedInfo.AccessKeyLastUsed.ServiceName == "N/A"
+		
+		if keyNeverUsed {
+			fmt.Printf("Access key %s has never been used. Deleting...\n", keyID)
+			if err := iamClient.deleteAccessKey(ctx, username, keyID); err != nil {
+				return err
+			}
+			continue
+		}
+		
+		// Key has been used - check if it needs rotation (older than 30 days)
+		// Use the creation date of the key as rotation reference point
+		lastRotated := keyMetadata.CreateDate
+		if lastRotated == nil {
+			return fmt.Errorf("missing creation date for access key %s", keyID)
+		}
+		
+		if time.Since(*lastRotated) > 30*24*time.Hour {
+			fmt.Printf("Access key %s is older than 30 days (created on %s). Rotating...\n", 
+				keyID, lastRotated.Format("2006-01-02"))
+			if err := iamClient.rotateAccessKey(ctx, username, keyID); err != nil {
+				return err
+			}
+			keyRotated = true
+		} else {
+			fmt.Printf("Access key %s is less than 30 days old (created on %s). No action needed.\n", 
+				keyID, lastRotated.Format("2006-01-02"))
+			
+			// Display when the key was last used for informational purposes
+			if lastUsedInfo.AccessKeyLastUsed != nil && lastUsedInfo.AccessKeyLastUsed.LastUsedDate != nil {
+				fmt.Printf("  - Last used on %s", lastUsedInfo.AccessKeyLastUsed.LastUsedDate.Format("2006-01-02"))
+				if lastUsedInfo.AccessKeyLastUsed.ServiceName != nil {
+					fmt.Printf(" with service: %s", *lastUsedInfo.AccessKeyLastUsed.ServiceName)
+				}
+				if lastUsedInfo.AccessKeyLastUsed.Region != nil {
+					fmt.Printf(" in region: %s", *lastUsedInfo.AccessKeyLastUsed.Region)
+				}
+				fmt.Println()
+			}
+		}
+	}
+	
+	// Save updated credential report if any key was rotated
+	if keyRotated {
+		reportFilename := fmt.Sprintf("%s_credential_report.csv", username)
+		fmt.Printf("Generating updated credential report after key rotation...\n")
+		if err := iamClient.saveCredentialReport(ctx, reportFilename); err != nil {
+			fmt.Printf("Warning: Failed to save updated credential report: %v\n", err)
+		}
+	}
+	
+	return nil
+}
+
+func main() {
+	// Parse command line flags
+	userARN := flag.String("user", "", "IAM user ARN (required)")
+	flag.Parse()
+
+	if *userARN == "" {
+		fmt.Println("Error: IAM user ARN is required")
+		fmt.Println("Usage: iam-key-manager -user=arn:aws:iam::123456789012:user/username")
+		os.Exit(1)
+	}
+
+	// Create IAM client
+	iamClient, err := NewIAMClient()
+	if err != nil {
+		fmt.Printf("Error creating IAM client: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Process the specified user
+	err = processUser(context.Background(), iamClient, *userARN)
+	if err != nil {
+		fmt.Printf("Error processing user: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("IAM access key management completed successfully")
+}
