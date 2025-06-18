@@ -4,6 +4,8 @@ Find Service Catalog provisioned product matching specific account information.
 
 This script searches through AWS Service Catalog provisioned products for a specific product,
 extracts account information from outputs, and returns the provisioned product ID matching a given account ID.
+
+Handles pagination manually since search_provisioned_products doesn't support automatic pagination.
 """
 
 import argparse
@@ -16,7 +18,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 # Configure logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    format="%(asctime)s | %(levelname)-8s | %(name)-16s | %(message)s",
     level=logging.INFO,
     datefmt="%Y-%m-%d %H:%M:%S"
 )
@@ -34,6 +36,8 @@ def parse_arguments():
     parser.add_argument("--region", default="eu-central-1",
                         help="AWS region name")
     parser.add_argument("--profile", help="AWS CLI profile name")
+    parser.add_argument("--max-results", type=int, default=20,
+                        help="Max results per API call (AWS limit: 100)")
     
     return parser.parse_args()
 
@@ -46,7 +50,7 @@ def get_servicecatalog_client(region, profile=None):
         logger.error("AWS API connection failed: %s", error)
         sys.exit(1)
 
-def find_matching_provisioned_product(client, product_id, target_account_id):
+def find_matching_provisioned_product(client, product_id, target_account_id, max_results):
     """
     Search provisioned products and find matching account ID.
     
@@ -54,21 +58,44 @@ def find_matching_provisioned_product(client, product_id, target_account_id):
         client: Service Catalog client
         product_id: Product ID to search
         target_account_id: Account ID to match
+        max_results: Max results per API call
     
     Returns:
         Matching provisioned product ID or None
     """
-    paginator = client.get_paginator('search_provisioned_products')
-    
+    next_page_token = None
+    processed_count = 0
+
     try:
-        for page in paginator.paginate(
-            Filters={'SearchQuery': [f"productId:{product_id}"]},
-            AccessLevelFilter={'Key': 'Account', 'Value': 'self'}
-        ):
-            for product in page.get('ProvisionedProducts', []):
+        while True:
+            # Prepare API parameters
+            params = {
+                'Filters': {'SearchQuery': [f"productId:{product_id}"]},
+                'AccessLevelFilter': {'Key': 'Account', 'Value': 'self'},
+                'PageSize': max_results
+            }
+            if next_page_token:
+                params['PageToken'] = next_page_token
+
+            # Execute API call
+            response = client.search_provisioned_products(**params)
+            products = response.get('ProvisionedProducts', [])
+            logger.info("Processing %d provisioned products", len(products))
+            processed_count += len(products)
+
+            # Process each product
+            for product in products:
                 pp_id = product['Id']
+                logger.debug("Checking provisioned product: %s", pp_id)
                 if process_provisioned_product(client, pp_id, target_account_id):
                     return pp_id
+
+            # Handle pagination
+            next_page_token = response.get('NextPageToken')
+            if not next_page_token:
+                logger.info("Finished processing %d products", processed_count)
+                break
+
     except ClientError as error:
         logger.error("AWS API request failed: %s", error)
         sys.exit(1)
@@ -89,13 +116,17 @@ def process_provisioned_product(client, provisioned_product_id, target_account_i
     """
     try:
         response = client.describe_provisioned_product(Id=provisioned_product_id)
-        outputs = response.get('Outputs', [])
+        outputs = response['ProvisionedProductDetail'].get('Outputs', [])
         
         for output in outputs:
             if output.get('OutputKey') == 'CallbackData':
-                return check_callback_data(output['OutputValue'], target_account_id)
+                callback_value = output.get('OutputValue', '')
+                if callback_value and check_callback_data(callback_value, target_account_id):
+                    return True
     except ClientError as error:
         logger.warning("Skipping product %s: %s", provisioned_product_id, error)
+    except KeyError as error:
+        logger.warning("Unexpected response structure for product %s: %s", provisioned_product_id, error)
     
     return False
 
@@ -111,10 +142,11 @@ def check_callback_data(callback_data, target_account_id):
         True if account matches, False otherwise
     """
     try:
+        # Handle potential double-encoded JSON
         outer_data = json.loads(callback_data)
         account_info = json.loads(outer_data['AccountInfo'])
         return account_info.get('account_id') == target_account_id
-    except (KeyError, json.JSONDecodeError) as error:
+    except (KeyError, json.JSONDecodeError, TypeError) as error:
         logger.warning("Invalid CallbackData format: %s", error)
         return False
 
@@ -124,11 +156,17 @@ def main():
     logger.info("Starting search for account: %s in product: %s", 
                 args.account_id, args.product_id)
     
+    # Validate max results within AWS limits
+    if args.max_results > 100 or args.max_results < 1:
+        logger.error("Max results must be between 1 and 100")
+        sys.exit(2)
+    
     sc_client = get_servicecatalog_client(args.region, args.profile)
     result = find_matching_provisioned_product(
-        sc_client,
-        args.product_id,
-        args.account_id
+        client=sc_client,
+        product_id=args.product_id,
+        target_account_id=args.account_id,
+        max_results=args.max_results
     )
     
     if result:
