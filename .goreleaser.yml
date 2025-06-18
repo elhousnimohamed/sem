@@ -2,14 +2,9 @@
 project_name: cb-cli
 
 builds:
-  - main: ./cmd/cb-cli  # Adjust if your main.go is elsewhere
-    goos:
-      - linux
-    goarch:
-      - amd64
+  - id: minimal
+    goos: [linux]
+    goarch: [amd64]
+    env: [CGO_ENABLED=0]
     ldflags:
-      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}} -X main.builtBy=goreleaser
-
-archives:
-  - format: tar.gz
-    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+      - -s -w -X main.version={{.Version}}
