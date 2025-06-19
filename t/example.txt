@@ -1,0 +1,189 @@
+Here's the updated database schema based on your new Python models, including all new fields and the new Mapping table:
+
+### Database Schema (Azure Table Storage)
+**Tables:**
+1. `Product`
+2. `ProductAction`
+3. `ServiceRequest`
+4. `Result`
+5. `Mapping`
+
+---
+
+### 1. Product Table
+| Column             | Type     | Description                   | Constraints         |
+|--------------------|----------|-------------------------------|---------------------|
+| PartitionKey       | String   | Primary key part 1            | Not null            |
+| RowKey             | String   | Primary key part 2 (Unique ID)| Not null            |
+| Timestamp          | DateTime | System-generated timestamp    | Auto               |
+| ETag               | String   | Concurrency token             | Optional            |
+| **Name**           | String   | Product name                  | Not null            |
+| **ConfigurationsJson** | String | JSON configurations           | Default = `'{}'`    |
+| **Platform**       | String   | Target platform               | Default = `''`      |
+
+---
+
+### 2. ProductAction Table
+| Column             | Type     | Description                   | Constraints         |
+|--------------------|----------|-------------------------------|---------------------|
+| PartitionKey       | String   | Primary key part 1            | Not null            |
+| RowKey             | String   | Primary key part 2 (Unique ID)| Not null            |
+| Timestamp          | DateTime | System-generated timestamp    | Auto               |
+| ETag               | String   | Concurrency token             | Optional            |
+| **Name**           | String   | Action name                   | Not null            |
+| **ActionType**     | String   | Action category               | Not null            |
+| **ConfigurationsJson** | String | JSON configurations           | Default = `'{}'`    |
+
+---
+
+### 3. ServiceRequest Table
+| Column               | Type     | Description                     | Constraints                     |
+|----------------------|----------|---------------------------------|---------------------------------|
+| PartitionKey         | String   | Primary key part 1              | Not null                        |
+| RowKey               | String   | Primary key part 2 (Unique ID)  | Not null                        |
+| Timestamp            | DateTime | System-generated timestamp      | Auto                           |
+| ETag                 | String   | Concurrency token               | Optional                        |
+| **ProductRowKey**    | String   | Reference to Product.RowKey     | Foreign Key → `Product.RowKey`  |
+| **ActionRowKey**     | String   | Reference to ProductAction.RowKey | Foreign Key → `ProductAction.RowKey` |
+| Environnement        | String   | Environment name                | Default = `'dv'`                |
+| Status               | String   | Request status                  | Default = `'Created'`           |
+| **Entity**           | String   | Target entity                   | Default = `'NXL'`               |
+| RequestType          | String   | Request category                | Default = `'SPN'`               |
+| **RITM**             | String   | ServiceNow RITM number          | Default = `''`                  |
+| **Created_by**       | String   | Request creator                 | Default = `''`                  |
+| **ConfigurationsJson** | String | JSON configurations             | Default = `'{}'`                |
+| **RequestAction**    | String   | Action to perform               | Default = `'Create'`            |
+| **Platform**         | String   | Target platform                 | Default = `''`                  |
+
+---
+
+### 4. Result Table
+| Column                | Type      | Description                     | Constraints                         |
+|-----------------------|-----------|---------------------------------|-------------------------------------|
+| PartitionKey          | String    | Primary key part 1              | Not null                            |
+| RowKey                | String    | Primary key part 2 (Unique ID)  | Not null                            |
+| Timestamp             | DateTime  | System-generated timestamp      | Auto                               |
+| ETag                  | String    | Concurrency token               | Optional                            |
+| **Success**           | Boolean   | Operation success status        | Not null                            |
+| Status                | String    | Result status                   | Default = `'Pending'`               |
+| BackendOutput         | String    | Backend process output          | Optional                            |
+| Notification          | String    | Notification message            | Optional                            |
+| **ServiceRequestRowKey** | String  | Reference to ServiceRequest     | Foreign Key → `ServiceRequest.RowKey` |
+| **Platform**          | String    | Target platform                 | Default = `''`                      |
+| **Message**           | String    | Result message                  | Not null                            |
+| **ConfigurationsJson**| String    | JSON configurations             | Default = `'{}'`                    |
+
+---
+
+### 5. Mapping Table (New)
+| Column                | Type     | Description                     | Constraints         |
+|-----------------------|----------|---------------------------------|---------------------|
+| PartitionKey          | String   | Primary key part 1              | Not null            |
+| RowKey                | String   | Primary key part 2 (Unique ID)  | Not null            |
+| Timestamp             | DateTime | System-generated timestamp      | Auto               |
+| ETag                  | String   | Concurrency token               | Optional            |
+| **ServiceNowField**   | String   | ServiceNow field name           | Not null            |
+| **ServiceRequestField**| String  | ServiceRequest field name       | Not null            |
+| **TransformationRule**| String   | Data transformation logic       | Default = `''`      |
+| **RequestType**       | String   | Applicable request type         | Default = `'*'`     |
+
+---
+
+### Relationship Diagram
+```mermaid
+erDiagram
+    Product ||--o{ ServiceRequest : "1 Product → Many ServiceRequests"
+    ProductAction ||--o{ ServiceRequest : "1 Action → Many ServiceRequests"
+    ServiceRequest ||--o{ Result : "1 Request → Many Results"
+
+    Product {
+        string PartitionKey
+        string RowKey PK
+        string Name
+        string ConfigurationsJson
+        string Platform
+    }
+    
+    ProductAction {
+        string PartitionKey
+        string RowKey PK
+        string Name
+        string ActionType
+        string ConfigurationsJson
+    }
+    
+    ServiceRequest {
+        string PartitionKey
+        string RowKey PK
+        string ProductRowKey FK
+        string ActionRowKey FK
+        string Environnement
+        string Status
+        string Entity
+        string RequestType
+        string RITM
+        string Created_by
+        string ConfigurationsJson
+        string RequestAction
+        string Platform
+    }
+    
+    Result {
+        string PartitionKey
+        string RowKey PK
+        bool Success
+        string Status
+        string ServiceRequestRowKey FK
+        string Platform
+        string Message
+        string ConfigurationsJson
+    }
+    
+    Mapping {
+        string PartitionKey
+        string RowKey PK
+        string ServiceNowField
+        string ServiceRequestField
+        string TransformationRule
+        string RequestType
+    }
+```
+
+### Key Changes from Previous Version:
+1. **New Fields:**
+   - `Product`: Added `Platform`
+   - `ServiceRequest`: Added `Entity`, `RITM`, `Created_by`, `RequestAction`, and `Platform`
+   - `Result`: Added `Platform`
+   
+2. **New Table:**
+   - `Mapping`: Stores field mapping configurations between ServiceNow and ServiceRequest
+     - `ServiceNowField`: Source field in ServiceNow
+     - `ServiceRequestField`: Target field in ServiceRequest
+     - `TransformationRule`: Data transformation logic
+     - `RequestType`: Applicable request type (`'*'` for all types)
+
+3. **Field Changes:**
+   - `ServiceRequest.Environnement` → Fixed spelling (previously `Environnement` in code)
+   - `ServiceRequest.Entity`: New field with default `'NXL'`
+   - `Result.Platform`: Added platform context to results
+
+4. **Default Values:**
+   - New default values for several fields (`Created_by`, `RITM`, `RequestAction` etc.)
+   - `Mapping.TransformationRule` defaults to empty string
+   - `Mapping.RequestType` defaults to `'*'` (wildcard)
+
+### Usage Notes:
+1. **JSON Fields:** All `ConfigurationsJson` fields store JSON strings that can be parsed to dictionaries
+2. **Relationships:** Maintained through RowKey references (application-managed)
+3. **Mapping Table:** Used for dynamic field mapping between ServiceNow and ServiceRequest objects
+4. **Special Fields:**
+   - `ServiceRequest.RITM`: Tracks ServiceNow Request Item number
+   - `ServiceRequest.RequestAction`: Typically "Create" or "Delete"
+   - `Result.Status`: Tracks progress ("Pending", "Completed", etc.)
+
+This schema supports a service catalog system where:
+1. Products define services
+2. ProductActions define operations on services
+3. ServiceRequests represent user requests
+4. Results track execution outcomes
+5. Mappings configure integration with ServiceNow
