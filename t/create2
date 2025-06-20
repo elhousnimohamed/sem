@@ -1,0 +1,235 @@
+import os
+import json
+import logging
+import boto3
+import requests
+from botocore.exceptions import ClientError, BotoCoreError
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def get_env_variable(name):
+    """Retrieve environment variable with error handling"""
+    value = os.environ.get(name)
+    if value is None:
+        logger.error(f"Missing required environment variable: {name}")
+        raise EnvironmentError(f"Missing environment variable: {name}")
+    return value
+
+def check_endpoint(endpoint_url):
+    """Check if endpoint returns an empty list"""
+    try:
+        response = requests.get(endpoint_url, timeout=10)
+        response.raise_for_status()
+        return response.json() == []
+    except (requests.RequestException, ValueError) as e:
+        logger.error(f"Endpoint check failed: {str(e)}")
+        return False
+
+def assume_role(role_arn, session_name):
+    """Assume IAM role and return temporary credentials"""
+    try:
+        sts_client = boto3.client('sts')
+        response = sts_client.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName=session_name
+        )
+        return response['Credentials']
+    except ClientError as e:
+        logger.error(f"Role assumption failed: {e.response['Error']['Message']}")
+        raise
+
+def get_service_catalog_client(credentials, region):
+    """Create Service Catalog client with assumed role credentials"""
+    return boto3.client(
+        'servicecatalog',
+        region_name=region,
+        aws_access_key_id=credentials['AccessKeyId'],
+        aws_secret_access_key=credentials['SecretAccessKey'],
+        aws_session_token=credentials['SessionToken']
+    )
+
+def get_portfolio_id(servicecatalog_client, portfolio_name):
+    """
+    Retrieves the Portfolio ID from AWS Service Catalog based on the portfolio name.
+
+    Args:
+        servicecatalog_client: Boto3 Service Catalog client.
+        portfolio_name (str): The name of the Service Catalog portfolio.
+
+    Returns:
+        str: The Portfolio ID if found, otherwise None.
+    """
+    try:
+        response = servicecatalog_client.list_portfolios()
+        for portfolio in response.get('PortfolioDetails', []):
+            if portfolio['DisplayName'] == portfolio_name:
+                logger.info(f"Found portfolio '{portfolio_name}' with ID: {portfolio['Id']}")
+                return portfolio['Id']
+        logger.error(f"Portfolio '{portfolio_name}' not found.")
+        return None
+    except Exception as e:
+        logger.error(f"Error listing portfolios: {e}")
+        return None
+
+def get_product_id_and_artifact_id(servicecatalog_client, product_name, portfolio_id):
+    """
+    Retrieves the Product ID and the latest Provisioning Artifact ID from a given portfolio.
+
+    Args:
+        servicecatalog_client: Boto3 Service Catalog client.
+        product_name (str): The name of the Service Catalog product.
+        portfolio_id (str): The ID of the portfolio where the product resides.
+
+    Returns:
+        tuple: A tuple containing (product_id, provisioning_artifact_id) if found, otherwise (None, None).
+    """
+    try:
+        # First, list products associated with the portfolio
+        response = servicecatalog_client.search_products_as_admin(
+            PortfolioId=portfolio_id
+        )
+        product_id = None
+        for product in response.get('ProductViewDetails', []):
+            if product['ProductViewSummary']['Name'] == product_name:
+                product_id = product['ProductViewSummary']['ProductId']
+                logger.info(f"Found product '{product_name}' with ID: {product_id} in portfolio {portfolio_id}")
+                break
+
+        if not product_id:
+            logger.error(f"Product '{product_name}' not found in portfolio '{portfolio_id}'.")
+            return None, None
+
+        # Then, get the latest provisioning artifact (version) for the product
+        product_artifact_response = servicecatalog_client.list_provisioning_artifacts(
+            ProductId=product_id
+        )
+        provisioning_artifacts = product_artifact_response.get('ProvisioningArtifactDetails', [])
+
+        if not provisioning_artifacts:
+            logger.error(f"No provisioning artifacts found for product '{product_name}'.")
+            return product_id, None
+
+        # Sort artifacts by creation time (most recent first) to get the latest
+        provisioning_artifacts.sort(key=lambda x: x['CreatedTime'], reverse=True)
+        latest_artifact_id = provisioning_artifacts[0]['Id']
+        logger.info(f"Using latest provisioning artifact ID: {latest_artifact_id} for product '{product_name}'.")
+
+        return product_id, latest_artifact_id
+
+    except Exception as e:
+        logger.error(f"Error retrieving product or artifact ID: {e}")
+        return None, None
+
+
+def find_product_id(servicecatalog_client, portfolio_name, product_name):
+    """Retrieve product ID from Service Catalog"""
+    try:
+        # Find portfolio ID
+        portfolio_id = get_portfolio_id(servicecatalog_client, portfolio_name)
+
+        if not portfolio_id:
+            raise ValueError(f"Portfolio '{portfolio_name}' not found")
+        
+        # Find product ID
+        # Get Product ID and Provisioning Artifact ID
+        product_id, provisioning_artifact_id = get_product_id_and_artifact_id(
+            servicecatalog_client, product_name, portfolio_id)
+        
+        if not product_id or not provisioning_artifact_id:
+            raise ValueError(f"Product '{product_name}' not found in portfolio")
+        
+        return {'ProductId': product_id, 'ProvisioningArtifactId': provisioning_artifact_id}
+    except (ClientError, BotoCoreError, StopIteration) as e:
+        logger.error(f"Product lookup failed: {str(e)}")
+        raise
+
+def build_provisioning_parameters(event):
+    """Construct provisioning parameters from event and environment"""
+    # Parameters from environment variables
+    env_params = {
+        'Region': get_env_variable('REGION'),
+        'globalOPCOTag': get_env_variable('GLOBAL_OPCO_TAG'),
+        'enableAccountLevelEBSDefaultEncryption': get_env_variable('ENABLE_EBS_ENCRYPTION'),
+        'accountOwner': get_env_variable('ACCOUNT_OWNER'),
+        'waitPeriodForUpdate': get_env_variable('WAIT_PERIOD'),
+        'timeWindow': get_env_variable('TIME_WINDOW'),
+        'weekdays': get_env_variable('WEEKDAYS'),
+        'billingContactEmail': get_env_variable('BILLING_EMAIL'),
+        'operationContactEmail': get_env_variable('OPERATION_EMAIL'),
+        'securityContactEmail': get_env_variable('SECURITY_EMAIL')
+    }
+    
+    # Parameters from event payload
+    event_params = {key: event.get(key) for key in [
+        'Environment', 'deployMPIRoles', 'deployProject', 'accountManager',
+        'budgetLimit', 'accountName', 'globalDCSTag', 'deployCIS',
+        'deployCustomConfigRules', 'bigDataAccount', 'bigDataCustom',
+        'localDescriptionTag'
+    ]}
+    
+    # Merge parameters and format for Service Catalog
+    merged = {**env_params, **event_params}
+    return [{'Key': k, 'Value': str(v)} for k, v in merged.items()]
+
+def provision_product(sc_client, product_id, artifact_id , params):
+    """Provision Service Catalog product"""
+    try:
+        response = sc_client.provision_product(
+            ProductId=product_id,
+            ProvisioningArtifactId= artifact_id,
+            ProvisionedProductName=params['accountName'],
+            ProvisioningParameters=params,
+            Tags=[{'Key': 'Owner', 'Value': params['accountOwner']}]
+        )
+        return response['RecordDetail']['ProvisionedProductId']
+    except ClientError as e:
+        logger.error(f"Provisioning failed: {e.response['Error']['Message']}")
+        raise
+
+def lambda_handler(event, context):
+    logger.info(f"Received event: {json.dumps(event)}")
+    
+    action = event.get('action', '').lower()
+    
+    try:
+        # Handle different actions
+        if action == 'create':
+            # Check endpoint
+            endpoint_url = get_env_variable('ENDPOINT_API')
+            if not check_endpoint(endpoint_url):
+                logger.info("Endpoint returned non-empty list. Skipping creation.")
+                return {"status": "skipped", "message": "Endpoint check failed"}
+            
+            # Assume role
+            role_arn = get_env_variable('TARGET_ROLE_ARN')
+            credentials = assume_role(role_arn, 'ServiceCatalogProvisioning')
+            
+            # Get Service Catalog client
+            region = get_env_variable('REGION')
+            sc_client = get_service_catalog_client(credentials, region)
+            
+            # Get product ID
+            portfolio = get_env_variable('PORTFOLIO_NAME')
+            product = get_env_variable('PRODUCT_NAME')
+            product_info = find_product_id(sc_client, portfolio, product)
+            
+            # Prepare parameters
+            params = build_provisioning_parameters(event)
+            
+            # Provision product
+            provision_id = provision_product(sc_client, product_info['ProductId'],product_info['ProvisioningArtifactId'] ,params)
+            return {"status": "success", "provisioned_product_id": provision_id}
+        
+        elif action in ('update', 'delete'):
+            logger.info(f"Action '{action}' not implemented. Skipping.")
+            return {"status": "skipped", "message": f"{action} operation not implemented"}
+        
+        else:
+            logger.error(f"Invalid action specified: {action}")
+            return {"status": "error", "message": "Invalid action specified"}
+    
+    except Exception as e:
+        logger.exception("Unhandled exception occurred")
+        return {"status": "error", "message": str(e)}
