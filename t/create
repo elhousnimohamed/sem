@@ -1,0 +1,184 @@
+import boto3
+import logging
+import uuid
+
+# Configure logging for better visibility of script execution
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger()
+
+def get_portfolio_id(servicecatalog_client, portfolio_name):
+    """
+    Retrieves the Portfolio ID from AWS Service Catalog based on the portfolio name.
+
+    Args:
+        servicecatalog_client: Boto3 Service Catalog client.
+        portfolio_name (str): The name of the Service Catalog portfolio.
+
+    Returns:
+        str: The Portfolio ID if found, otherwise None.
+    """
+    try:
+        response = servicecatalog_client.list_portfolios()
+        for portfolio in response.get('PortfolioDetails', []):
+            if portfolio['DisplayName'] == portfolio_name:
+                logger.info(f"Found portfolio '{portfolio_name}' with ID: {portfolio['Id']}")
+                return portfolio['Id']
+        logger.error(f"Portfolio '{portfolio_name}' not found.")
+        return None
+    except Exception as e:
+        logger.error(f"Error listing portfolios: {e}")
+        return None
+
+def get_product_id_and_artifact_id(servicecatalog_client, product_name, portfolio_id):
+    """
+    Retrieves the Product ID and the latest Provisioning Artifact ID from a given portfolio.
+
+    Args:
+        servicecatalog_client: Boto3 Service Catalog client.
+        product_name (str): The name of the Service Catalog product.
+        portfolio_id (str): The ID of the portfolio where the product resides.
+
+    Returns:
+        tuple: A tuple containing (product_id, provisioning_artifact_id) if found, otherwise (None, None).
+    """
+    try:
+        # First, list products associated with the portfolio
+        response = servicecatalog_client.search_products_as_admin(
+            PortfolioId=portfolio_id
+        )
+        product_id = None
+        for product in response.get('ProductViewDetails', []):
+            if product['ProductViewSummary']['Name'] == product_name:
+                product_id = product['ProductViewSummary']['ProductId']
+                logger.info(f"Found product '{product_name}' with ID: {product_id} in portfolio {portfolio_id}")
+                break
+
+        if not product_id:
+            logger.error(f"Product '{product_name}' not found in portfolio '{portfolio_id}'.")
+            return None, None
+
+        # Then, get the latest provisioning artifact (version) for the product
+        product_artifact_response = servicecatalog_client.list_provisioning_artifacts(
+            ProductId=product_id
+        )
+        provisioning_artifacts = product_artifact_response.get('ProvisioningArtifactDetails', [])
+
+        if not provisioning_artifacts:
+            logger.error(f"No provisioning artifacts found for product '{product_name}'.")
+            return product_id, None
+
+        # Sort artifacts by creation time (most recent first) to get the latest
+        provisioning_artifacts.sort(key=lambda x: x['CreatedTime'], reverse=True)
+        latest_artifact_id = provisioning_artifacts[0]['Id']
+        logger.info(f"Using latest provisioning artifact ID: {latest_artifact_id} for product '{product_name}'.")
+
+        return product_id, latest_artifact_id
+
+    except Exception as e:
+        logger.error(f"Error retrieving product or artifact ID: {e}")
+        return None, None
+
+def provision_service_catalog_product(
+    product_name,
+    portfolio_name,
+    provisioned_product_name,
+    region_name='us-east-1' # Default region, change as needed
+):
+    """
+    Provisions an AWS Service Catalog product instance.
+
+    Args:
+        product_name (str): The name of the Service Catalog product to provision.
+        portfolio_name (str): The name of the portfolio where the product resides.
+        provisioned_product_name (str): A unique name for the provisioned product instance.
+        region_name (str): The AWS region to operate in.
+
+    Returns:
+        dict: The response from the provision_product API call if successful, otherwise None.
+    """
+    logger.info(f"Attempting to provision product '{product_name}' from portfolio '{portfolio_name}'...")
+
+    try:
+        # Initialize the Service Catalog client
+        servicecatalog_client = boto3.client('servicecatalog', region_name=region_name)
+    except Exception as e:
+        logger.critical(f"Failed to initialize Boto3 client. Check your AWS credentials and region. Error: {e}")
+        return None
+
+    # Get Portfolio ID
+    portfolio_id = get_portfolio_id(servicecatalog_client, portfolio_name)
+    if not portfolio_id:
+        return None
+
+    # Get Product ID and Provisioning Artifact ID
+    product_id, provisioning_artifact_id = get_product_id_and_artifact_id(
+        servicecatalog_client, product_name, portfolio_id
+    )
+    if not product_id or not provisioning_artifact_id:
+        return None
+
+    try:
+        # Provision the product
+        # If your product requires parameters, you would add them here in the 'ProvisioningParameters' list.
+        # Example:
+        # ProvisioningParameters=[
+        #     {'Key': 'InstanceType', 'Value': 't2.micro'},
+        #     {'Key': 'KeyPairName', 'Value': 'my-key-pair'}
+        # ]
+        response = servicecatalog_client.provision_product(
+            ProductId=product_id,
+            ProvisioningArtifactId=provisioning_artifact_id,
+            ProvisionedProductName=provisioned_product_name,
+            PortfolioId=portfolio_id,
+            # If your product has parameters, define them here:
+            # ProvisioningParameters=[
+            #     {
+            #         'Key': 'ParameterKey1',
+            #         'Value': 'ParameterValue1'
+            #     },
+            #     {
+            #         'Key': 'ParameterKey2',
+            #         'Value': 'ParameterValue2'
+            #     },
+            # ]
+            AcceptLanguage='en' # Or your preferred language
+        )
+        logger.info(f"Successfully initiated provisioning for '{provisioned_product_name}'.")
+        logger.info(f"Provisioned Product ID: {response['RecordDetail']['ProvisionedProductId']}")
+        logger.info(f"Record ID: {response['RecordDetail']['RecordId']}")
+        return response['RecordDetail']
+
+    except servicecatalog_client.exceptions.DuplicateResourceException:
+        logger.error(f"A provisioned product with the name '{provisioned_product_name}' already exists. Please use a unique name.")
+        return None
+    except Exception as e:
+        logger.error(f"Error provisioning product '{product_name}': {e}")
+        return None
+
+if __name__ == "__main__":
+    # --- Configuration ---
+    # Replace these with your actual Service Catalog product and portfolio names
+    MY_PRODUCT_NAME = "MyEC2Product"  # e.g., "Basic EC2 Instance"
+    MY_PORTFOLIO_NAME = "MyTeamPortfolio" # e.g., "DevOps Tools"
+    # A unique name for the new instance of the product.
+    # It's good practice to use a UUID or timestamp to ensure uniqueness.
+    MY_PROVISIONED_PRODUCT_INSTANCE_NAME = f"my-ec2-instance-{uuid.uuid4().hex[:8]}"
+    AWS_REGION = "us-east-1" # Make sure this matches your AWS region
+
+    logger.info("Starting Service Catalog product provisioning script.")
+
+    # Call the provisioning function
+    provision_result = provision_service_catalog_product(
+        product_name=MY_PRODUCT_NAME,
+        portfolio_name=MY_PORTFOLIO_NAME,
+        provisioned_product_name=MY_PROVISIONED_PRODUCT_INSTANCE_NAME,
+        region_name=AWS_REGION
+    )
+
+    if provision_result:
+        logger.info(f"Provisioning successful for instance '{MY_PROVISIONED_PRODUCT_INSTANCE_NAME}'.")
+        logger.info(f"You can monitor its status in AWS Service Catalog console using Record ID: {provision_result['RecordId']}")
+    else:
+        logger.error("Product provisioning failed.")
+
+    logger.info("Script execution finished.")
