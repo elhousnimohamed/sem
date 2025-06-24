@@ -1,0 +1,458 @@
+"""
+AWS Account Management Lambda Function
+
+This Lambda function manages AWS account operations (create, update, delete) 
+by interfacing with AWS Service Catalog in a separate account.
+"""
+
+import json
+import logging
+import os
+import sys
+from typing import Dict, Any, Optional, List
+from urllib.parse import urljoin
+
+import boto3
+import requests
+from botocore.exceptions import ClientError, BotoCoreError
+
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Create formatter
+formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Add formatter to handler if not already present
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+
+class ConfigurationError(Exception):
+    """Raised when configuration is invalid or missing."""
+    pass
+
+
+class ServiceCatalogError(Exception):
+    """Raised when Service Catalog operations fail."""
+    pass
+
+
+class APIEndpointError(Exception):
+    """Raised when API endpoint operations fail."""
+    pass
+
+
+class AWSAccountManager:
+    """Manages AWS account operations through Service Catalog."""
+    
+    def __init__(self):
+        """Initialize the AWS Account Manager with configuration."""
+        self.config = self._load_configuration()
+        self.service_catalog_client = None
+        
+    def _load_configuration(self) -> Dict[str, Any]:
+        """Load and validate configuration from environment variables."""
+        required_env_vars = [
+            'TOOL_ACCOUNT_ROLE_ARN',
+            'PORTFOLIO_NAME',
+            'PRODUCT_NAME',
+            'REGION',
+            'GLOBAL_OPCO_TAG',
+            'ENABLE_ACCOUNT_LEVEL_EBS_DEFAULT_ENCRYPTION',
+            'ACCOUNT_OWNER',
+            'WAIT_PERIOD_FOR_UPDATE',
+            'TIME_WINDOW',
+            'WEEKDAYS',
+            'BILLING_CONTACT_EMAIL',
+            'OPERATION_CONTACT_EMAIL',
+            'SECURITY_CONTACT_EMAIL',
+            'API_ENDPOINT_URL'
+        ]
+        
+        config = {}
+        missing_vars = []
+        
+        for var in required_env_vars:
+            value = os.environ.get(var)
+            if not value:
+                missing_vars.append(var)
+            else:
+                config[var.lower()] = value
+        
+        if missing_vars:
+            raise ConfigurationError(
+                f"Missing required environment variables: {', '.join(missing_vars)}"
+            )
+        
+        logger.info("Configuration loaded successfully")
+        return config
+    
+    def _assume_role(self, role_arn: str) -> boto3.Session:
+        """Assume a role and return a session with the assumed role credentials."""
+        try:
+            sts_client = boto3.client('sts')
+            
+            response = sts_client.assume_role(
+                RoleArn=role_arn,
+                RoleSessionName='AccountManagementSession'
+            )
+            
+            credentials = response['Credentials']
+            
+            session = boto3.Session(
+                aws_access_key_id=credentials['AccessKeyId'],
+                aws_secret_access_key=credentials['SecretAccessKey'],
+                aws_session_token=credentials['SessionToken']
+            )
+            
+            logger.info(f"Successfully assumed role: {role_arn}")
+            return session
+            
+        except ClientError as e:
+            logger.error(f"Failed to assume role {role_arn}: {e}")
+            raise ServiceCatalogError(f"Role assumption failed: {e}")
+    
+    def _get_service_catalog_client(self) -> boto3.client:
+        """Get Service Catalog client with assumed role credentials."""
+        if not self.service_catalog_client:
+            session = self._assume_role(self.config['tool_account_role_arn'])
+            self.service_catalog_client = session.client(
+                'servicecatalog',
+                region_name=self.config['region']
+            )
+        return self.service_catalog_client
+    
+    def _check_api_endpoint(self) -> bool:
+        """Check if API endpoint returns an empty list."""
+        try:
+            response = requests.get(
+                self.config['api_endpoint_url'],
+                timeout=30,
+                headers={'Content-Type': 'application/json'}
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Check if the response is a list and if it's empty
+            if isinstance(data, list):
+                is_empty = len(data) == 0
+                logger.info(f"API endpoint returned {'empty' if is_empty else 'non-empty'} list")
+                return is_empty
+            else:
+                logger.warning(f"API endpoint returned unexpected data type: {type(data)}")
+                return False
+                
+        except requests.RequestException as e:
+            logger.error(f"Failed to check API endpoint: {e}")
+            raise APIEndpointError(f"API endpoint check failed: {e}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse API response as JSON: {e}")
+            raise APIEndpointError(f"Invalid JSON response from API: {e}")
+    
+    def _get_product_id(self, portfolio_name: str, product_name: str) -> str:
+        """Retrieve product ID from Service Catalog."""
+        try:
+            sc_client = self._get_service_catalog_client()
+            
+            # Search for portfolios
+            portfolios_response = sc_client.search_portfolios()
+            
+            portfolio_id = None
+            for portfolio in portfolios_response.get('PortfolioDetails', []):
+                if portfolio['DisplayName'] == portfolio_name:
+                    portfolio_id = portfolio['Id']
+                    break
+            
+            if not portfolio_id:
+                raise ServiceCatalogError(f"Portfolio '{portfolio_name}' not found")
+            
+            logger.info(f"Found portfolio ID: {portfolio_id}")
+            
+            # Search for products in the portfolio
+            products_response = sc_client.search_products_as_admin(
+                PortfolioId=portfolio_id
+            )
+            
+            for product in products_response.get('ProductViewDetails', []):
+                if product['ProductViewSummary']['Name'] == product_name:
+                    product_id = product['ProductViewSummary']['ProductId']
+                    logger.info(f"Found product ID: {product_id}")
+                    return product_id
+            
+            raise ServiceCatalogError(f"Product '{product_name}' not found in portfolio '{portfolio_name}'")
+            
+        except ClientError as e:
+            logger.error(f"Failed to retrieve product ID: {e}")
+            raise ServiceCatalogError(f"Product ID retrieval failed: {e}")
+    
+    def _build_provisioning_parameters(self, event_payload: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Build provisioning parameters from event payload and environment variables."""
+        parameters = []
+        
+        # Parameters from event payload
+        event_params = [
+            'environment', 'deployMPIRoles', 'deployProject', 'accountManager',
+            'budgetLimit', 'accountName', 'globalDCSTag', 'deployCIS',
+            'deployCustomConfigRules', 'bigDataAccount', 'bigDataCustom',
+            'localDescriptionTag'
+        ]
+        
+        for param in event_params:
+            if param in event_payload:
+                value = event_payload[param]
+                # Convert boolean values to strings
+                if isinstance(value, bool):
+                    value = str(value).lower()
+                parameters.append({
+                    'Key': param,
+                    'Value': str(value)
+                })
+        
+        # Parameters from environment variables
+        env_params = [
+            ('region', 'Region'),
+            ('global_opco_tag', 'globalOPCOTag'),
+            ('enable_account_level_ebs_default_encryption', 'enableAccountLevelEBSDefaultEncryption'),
+            ('account_owner', 'accountOwner'),
+            ('wait_period_for_update', 'waitPeriodForUpdate'),
+            ('time_window', 'timeWindow'),
+            ('weekdays', 'weekdays'),
+            ('billing_contact_email', 'billingContactEmail'),
+            ('operation_contact_email', 'operationContactEmail'),
+            ('security_contact_email', 'securityContactEmail')
+        ]
+        
+        for config_key, param_key in env_params:
+            parameters.append({
+                'Key': param_key,
+                'Value': self.config[config_key]
+            })
+        
+        logger.info(f"Built {len(parameters)} provisioning parameters")
+        return parameters
+    
+    def create_account(self, event_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new AWS account through Service Catalog."""
+        try:
+            # Check API endpoint
+            if not self._check_api_endpoint():
+                logger.info("API endpoint returned non-empty list, skipping account creation")
+                return {
+                    'status': 'skipped',
+                    'message': 'Account creation skipped - API endpoint returned non-empty list'
+                }
+            
+            # Get product ID
+            product_id = self._get_product_id(
+                self.config['portfolio_name'],
+                self.config['product_name']
+            )
+            
+            # Build provisioning parameters
+            parameters = self._build_provisioning_parameters(event_payload)
+            
+            # Provision the product
+            sc_client = self._get_service_catalog_client()
+            
+            account_name = event_payload.get('accountName', 'UnknownAccount')
+            
+            response = sc_client.provision_product(
+                ProductId=product_id,
+                ProvisioningArtifactId=self._get_latest_provisioning_artifact_id(product_id),
+                ProvisionedProductName=f"{account_name}-{self._generate_unique_suffix()}",
+                ProvisioningParameters=parameters
+            )
+            
+            logger.info(f"Account creation initiated successfully: {response['RecordDetail']['RecordId']}")
+            
+            return {
+                'status': 'success',
+                'message': 'Account creation initiated successfully',
+                'record_id': response['RecordDetail']['RecordId'],
+                'provisioned_product_id': response['RecordDetail'].get('ProvisionedProductId')
+            }
+            
+        except (ServiceCatalogError, APIEndpointError) as e:
+            logger.error(f"Account creation failed: {e}")
+            return {
+                'status': 'error',
+                'message': str(e)
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error during account creation: {e}")
+            return {
+                'status': 'error',
+                'message': f"Unexpected error: {str(e)}"
+            }
+    
+    def _get_latest_provisioning_artifact_id(self, product_id: str) -> str:
+        """Get the latest provisioning artifact ID for a product."""
+        try:
+            sc_client = self._get_service_catalog_client()
+            
+            response = sc_client.list_provisioning_artifacts(ProductId=product_id)
+            
+            artifacts = response.get('ProvisioningArtifactDetails', [])
+            if not artifacts:
+                raise ServiceCatalogError("No provisioning artifacts found for product")
+            
+            # Sort by creation date and get the latest
+            latest_artifact = max(artifacts, key=lambda x: x.get('CreatedTime', ''))
+            
+            return latest_artifact['Id']
+            
+        except ClientError as e:
+            logger.error(f"Failed to get provisioning artifact: {e}")
+            raise ServiceCatalogError(f"Provisioning artifact retrieval failed: {e}")
+    
+    def _generate_unique_suffix(self) -> str:
+        """Generate a unique suffix for provisioned product names."""
+        import time
+        return str(int(time.time()))
+    
+    def update_account(self, event_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Update an existing AWS account (placeholder implementation)."""
+        logger.info("Update account operation called")
+        return {
+            'status': 'not_implemented',
+            'message': 'Update operation not yet implemented'
+        }
+    
+    def delete_account(self, event_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Delete an AWS account (placeholder implementation)."""
+        logger.info("Delete account operation called")
+        return {
+            'status': 'not_implemented',
+            'message': 'Delete operation not yet implemented'
+        }
+
+
+def validate_event(event: Dict[str, Any]) -> None:
+    """Validate the incoming event structure."""
+    if 'action' not in event:
+        raise ValueError("Event must contain 'action' field")
+    
+    valid_actions = ['create', 'update', 'delete']
+    if event['action'] not in valid_actions:
+        raise ValueError(f"Invalid action. Must be one of: {valid_actions}")
+    
+    if event['action'] == 'create':
+        required_fields = [
+            'environment', 'deployMPIRoles', 'deployProject', 'accountManager',
+            'budgetLimit', 'accountName', 'globalDCSTag', 'deployCIS',
+            'deployCustomConfigRules', 'bigDataAccount', 'bigDataCustom',
+            'localDescriptionTag'
+        ]
+        
+        missing_fields = [field for field in required_fields if field not in event]
+        if missing_fields:
+            raise ValueError(f"Missing required fields for create action: {missing_fields}")
+
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    AWS Lambda handler for account management operations.
+    
+    Args:
+        event: Event payload containing action and parameters
+        context: Lambda context object
+        
+    Returns:
+        Response dictionary with operation result
+    """
+    try:
+        logger.info(f"Received event: {json.dumps(event, default=str)}")
+        
+        # Validate event
+        validate_event(event)
+        
+        # Initialize account manager
+        account_manager = AWSAccountManager()
+        
+        # Execute the requested action
+        action = event['action']
+        
+        if action == 'create':
+            result = account_manager.create_account(event)
+        elif action == 'update':
+            result = account_manager.update_account(event)
+        elif action == 'delete':
+            result = account_manager.delete_account(event)
+        else:
+            # This should not happen due to validation, but keeping for safety
+            raise ValueError(f"Unsupported action: {action}")
+        
+        logger.info(f"Operation completed: {result}")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps(result)
+        }
+        
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        return {
+            'statusCode': 400,
+            'body': json.dumps({
+                'status': 'error',
+                'message': f"Validation error: {str(e)}"
+            })
+        }
+        
+    except ConfigurationError as e:
+        logger.error(f"Configuration error: {e}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'status': 'error',
+                'message': f"Configuration error: {str(e)}"
+            })
+        }
+        
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'status': 'error',
+                'message': f"Internal server error: {str(e)}"
+            })
+        }
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Example event for testing
+    test_event = {
+        "action": "create",
+        "environment": "dev",
+        "deployMPIRoles": "true",
+        "deployProject": "test-project",
+        "accountManager": "john.doe@example.com",
+        "budgetLimit": "1000",
+        "accountName": "test-account",
+        "globalDCSTag": "DCS-001",
+        "deployCIS": True,
+        "deployCustomConfigRules": False,
+        "bigDataAccount": "false",
+        "bigDataCustom": "none",
+        "localDescriptionTag": "Test Account"
+    }
+    
+    # Mock context for testing
+    class MockContext:
+        def __init__(self):
+            self.function_name = "test-function"
+            self.memory_limit_in_mb = 128
+            self.invoked_function_arn = "arn:aws:lambda:us-east-1:123456789012:function:test-function"
+    
+    # Run the handler
+    result = lambda_handler(test_event, MockContext())
+    print(json.dumps(result, indent=2))
