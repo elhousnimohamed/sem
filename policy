@@ -1,0 +1,115 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ServiceCatalogRead",
+      "Effect": "Allow",
+      "Action": [
+        "servicecatalog:SearchPortfolios",
+        "servicecatalog:ListPortfolios",
+        "servicecatalog:DescribePortfolio"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ServiceCatalogProducts",
+      "Effect": "Allow",
+      "Action": [
+        "servicecatalog:SearchProductsAsAdmin",
+        "servicecatalog:DescribeProduct",
+        "servicecatalog:DescribeProductAsAdmin",
+        "servicecatalog:ListProvisioningArtifacts",
+        "servicecatalog:DescribeProvisioningArtifact"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ServiceCatalogProvision",
+      "Effect": "Allow",
+      "Action": [
+        "servicecatalog:ProvisionProduct",
+        "servicecatalog:UpdateProvisionedProduct",
+        "servicecatalog:TerminateProvisionedProduct",
+        "servicecatalog:DescribeRecord",
+        "servicecatalog:ListRecordHistory",
+        "servicecatalog:DescribeProvisionedProduct"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "servicecatalog:productType": "CLOUD_FORMATION_TEMPLATE"
+        }
+      }
+    },
+    {
+      "Sid": "CloudFormationAccess",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:DescribeStackResources",
+        "cloudformation:GetTemplate"
+      ],
+      "Resource": "arn:aws:cloudformation:*:*:stack/SC-*"
+    },
+    {
+      "Sid": "OrganizationsReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "organizations:DescribeAccount",
+        "organizations:DescribeOrganization",
+        "organizations:ListAccounts"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+--------------------------------------------------------------------------------
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BasicLambdaExecution",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:*:*:*"
+    },
+    {
+      "Sid": "CloudWatchMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AssumeServiceCatalogRole",
+      "Effect": "Allow",
+      "Action": [
+        "sts:AssumeRole"
+      ],
+      "Resource": "arn:aws:iam::TOOL-ACCOUNT-ID:role/ServiceCatalogCrossAccountRole"
+    },
+    {
+      "Sid": "VPCAccess",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkInterface",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DeleteNetworkInterface",
+        "ec2:AttachNetworkInterface",
+        "ec2:DetachNetworkInterface"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": ["us-east-1", "us-west-2"]
+        }
+      }
+    }
+  ]
+}
