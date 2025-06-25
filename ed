@@ -1,0 +1,151 @@
+import boto3
+import uuid
+from botocore.exceptions import ClientError
+
+def assume_role(role_arn, session_name):
+    """Assume an IAM role and return temporary credentials"""
+    try:
+        sts_client = boto3.client('sts')
+        response = sts_client.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName=session_name
+        )
+        return response['Credentials']
+    except ClientError as e:
+        print(f"Error assuming role: {e}")
+        raise
+
+def get_service_catalog_client(credentials, region=None):
+    """Create a Service Catalog client using assumed role credentials"""
+    return boto3.client(
+        'servicecatalog',
+        aws_access_key_id=credentials['AccessKeyId'],
+        aws_secret_access_key=credentials['SecretAccessKey'],
+        aws_session_token=credentials['SessionToken'],
+        region_name=region
+    )
+
+def find_portfolio_id(sc_client, portfolio_name):
+    """Find portfolio ID by display name with pagination"""
+    try:
+        portfolios = []
+        response = sc_client.list_portfolios()
+        portfolios.extend(response['PortfolioDetails'])
+        
+        while 'NextPageToken' in response:
+            response = sc_client.list_portfolios(PageToken=response['NextPageToken'])
+            portfolios.extend(response['PortfolioDetails'])
+            
+        for portfolio in portfolios:
+            if portfolio['DisplayName'] == portfolio_name:
+                return portfolio['Id']
+                
+        raise ValueError(f"Portfolio '{portfolio_name}' not found")
+    except ClientError as e:
+        print(f"Error listing portfolios: {e}")
+        raise
+
+def find_product_id(sc_client, portfolio_id, product_name):
+    """Find product ID in a specific portfolio with pagination"""
+    try:
+        products = []
+        response = sc_client.list_products_for_portfolio(PortfolioId=portfolio_id)
+        products.extend(response['ProductViewSummaries'])
+        
+        while 'NextPageToken' in response:
+            response = sc_client.list_products_for_portfolio(
+                PortfolioId=portfolio_id,
+                PageToken=response['NextPageToken']
+            )
+            products.extend(response['ProductViewSummaries'])
+            
+        for product in products:
+            if product['Name'] == product_name:
+                return product['ProductId']
+                
+        raise ValueError(f"Product '{product_name}' not found in portfolio")
+    except ClientError as e:
+        print(f"Error listing products: {e}")
+        raise
+
+def get_default_provisioning_artifact(sc_client, product_id):
+    """Get the default provisioning artifact for a product"""
+    try:
+        response = sc_client.describe_product(Id=product_id)
+        
+        # Find the default artifact if available
+        for artifact in response['ProvisioningArtifacts']:
+            if artifact.get('Guidance', '') == 'DEFAULT':
+                return artifact['Id']
+                
+        # Fallback to the first artifact if no default found
+        return response['ProvisioningArtifacts'][0]['Id']
+        
+    except (ClientError, IndexError, KeyError) as e:
+        print(f"Error getting provisioning artifacts: {e}")
+        raise
+
+def provision_product(sc_client, product_id, artifact_id, product_name):
+    """Provision a Service Catalog product"""
+    try:
+        response = sc_client.provision_product(
+            ProductId=product_id,
+            ProvisioningArtifactId=artifact_id,
+            ProvisionedProductName=product_name,
+            ProvisionToken=str(uuid.uuid4())  # Idempotency token
+        )
+        return response['RecordDetail']['ProvisionedProductId']
+    except ClientError as e:
+        print(f"Error provisioning product: {e}")
+        raise
+
+def lambda_handler(event, context):
+    # Configuration - Replace these values
+    TARGET_ACCOUNT_ROLE_ARN = 'arn:aws:iam::TARGET_ACCOUNT_ID:role/ServiceCatalogExecutionRole'
+    PORTFOLIO_NAME = 'MyPortfolio'
+    PRODUCT_NAME = 'MyProduct'
+    PROVISIONED_PRODUCT_NAME = 'MyProvisionedProduct'  # Name for the provisioned instance
+    TARGET_REGION = 'us-east-1'  # Region where Service Catalog is located
+
+    try:
+        # Assume role in target account
+        credentials = assume_role(
+            TARGET_ACCOUNT_ROLE_ARN,
+            "ServiceCatalogProvisionerSession"
+        )
+        
+        # Create Service Catalog client in target region
+        sc_client = get_service_catalog_client(credentials, TARGET_REGION)
+        
+        # Find portfolio ID
+        portfolio_id = find_portfolio_id(sc_client, PORTFOLIO_NAME)
+        print(f"Found Portfolio ID: {portfolio_id}")
+        
+        # Find product ID
+        product_id = find_product_id(sc_client, portfolio_id, PRODUCT_NAME)
+        print(f"Found Product ID: {product_id}")
+        
+        # Get provisioning artifact ID
+        artifact_id = get_default_provisioning_artifact(sc_client, product_id)
+        print(f"Using Provisioning Artifact ID: {artifact_id}")
+        
+        # Provision the product
+        provisioned_id = provision_product(
+            sc_client,
+            product_id,
+            artifact_id,
+            PROVISIONED_PRODUCT_NAME
+        )
+        print(f"Successfully provisioned product. ID: {provisioned_id}")
+        
+        return {
+            'statusCode': 200,
+            'body': f"Product provisioned successfully: {provisioned_id}"
+        }
+    
+    except Exception as e:
+        print(f"Provisioning failed: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': f"Provisioning failed: {str(e)}"
+        }
