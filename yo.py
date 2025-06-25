@@ -1,173 +1,247 @@
-import json
+#!/usr/bin/env python3
+"""
+AWS Service Catalog Product Retriever
+
+This script retrieves all products from an AWS Service Catalog portfolio
+and finds a specific product ID by name.
+
+Requirements:
+    - boto3
+    - Appropriate AWS credentials configured
+    - AWS Service Catalog permissions
+
+Usage:
+    python service_catalog_retriever.py --portfolio-id <portfolio-id> --product-name <product-name>
+"""
+
 import argparse
+import logging
+import sys
+from typing import Dict, List, Optional, Tuple
 
-def format_resource_address(module_path, resource_type, resource_name, index_key=None):
-    """
-    Format the resource address considering modules and for_each.
-    
-    Args:
-        module_path (list): List of module names in the path
-        resource_type (str): Type of the resource
-        resource_name (str): Name of the resource
-        index_key: The for_each key if present
-    
-    Returns:
-        str: Formatted resource address
-    """
-    # Build module path if present
-    module_prefix = ""
-    if module_path:
-        module_prefix = "module." + ".module.".join(module_path) + "."
-    
-    # Build resource address
-    if index_key is not None:
-        # Handle for_each with proper quoting
-        if isinstance(index_key, str):
-            return f'{module_prefix}{resource_type}.{resource_name}["{index_key}"]'
-        else:
-            return f'{module_prefix}{resource_type}.{resource_name}[{index_key}]'
-    else:
-        return f'{module_prefix}{resource_type}.{resource_name}'
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
-def generate_import_blocks(state_file):
-    """
-    Generate Terraform import blocks from a tfstate file, including modules and for_each resources.
+
+class ServiceCatalogClient:
+    """AWS Service Catalog client wrapper with error handling."""
     
-    Args:
-        state_file (str): Path to the terraform.tfstate file
-    
-    Returns:
-        list: List of import block strings
-    """
-    import_blocks = []
-    dependencies = {}
-    
-    try:
-        with open(state_file, 'r') as f:
-            state_data = json.load(f)
-    except FileNotFoundError:
-        print(f"Error: State file {state_file} not found.")
-        return []
-    except json.JSONDecodeError:
-        print(f"Error: Invalid JSON in state file {state_file}.")
-        return []
-    
-    if 'resources' not in state_data:
-        print("No resources found in the state file.")
-        return []
-    
-    for resource in state_data['resources']:
-        resource_type = resource.get('type', '')
-        resource_name = resource.get('name', '')
-        module_path = resource.get('module', '').split('.module.') if resource.get('module') else []
+    def __init__(self, region_name: Optional[str] = None):
+        """
+        Initialize the Service Catalog client.
         
-        # Filter out empty strings from module path
-        module_path = [m for m in module_path if m]
+        Args:
+            region_name: AWS region name. If None, uses default region.
+        """
+        try:
+            self.client = boto3.client('servicecatalog', region_name=region_name)
+            self.logger = logging.getLogger(__name__)
+        except NoCredentialsError:
+            raise ValueError("AWS credentials not found. Please configure your credentials.")
+        except Exception as e:
+            raise ValueError(f"Failed to initialize AWS Service Catalog client: {str(e)}")
+    
+    def list_portfolio_products(self, portfolio_id: str) -> List[Dict]:
+        """
+        List all products in a Service Catalog portfolio.
         
-        # Handle instances
-        if 'instances' in resource:
-            for instance in resource['instances']:
-                try:
-                    resource_id = instance['attributes'].get('id', '')
-                    if not resource_id:
-                        continue
-                    
-                    # Check for for_each key
-                    index_key = instance.get('index_key')
-                    
-                    # Format resource address
-                    resource_address = format_resource_address(
-                        module_path, 
-                        resource_type, 
-                        resource_name, 
-                        index_key
-                    )
-                    
-                    # Generate import command
-                    import_block = f"terraform import {resource_address} {resource_id}"
-                    
-                    # Store dependencies if present
-                    dependencies[resource_address] = instance.get('dependencies', [])
-                    
-                    import_blocks.append(import_block)
+        Args:
+            portfolio_id: The ID of the portfolio
+            
+        Returns:
+            List of product dictionaries
+            
+        Raises:
+            ValueError: If portfolio_id is invalid or API call fails
+        """
+        if not portfolio_id or not portfolio_id.strip():
+            raise ValueError("Portfolio ID cannot be empty")
+        
+        products = []
+        paginator = self.client.get_paginator('search_products_as_admin')
+        
+        try:
+            for page in paginator.paginate(PortfolioId=portfolio_id):
+                products.extend(page.get('ProductViewDetails', []))
+            
+            self.logger.info(f"Retrieved {len(products)} products from portfolio {portfolio_id}")
+            return products
+            
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            error_message = e.response['Error']['Message']
+            
+            if error_code == 'ResourceNotFoundException':
+                raise ValueError(f"Portfolio '{portfolio_id}' not found")
+            elif error_code == 'AccessDeniedException':
+                raise ValueError(f"Access denied to portfolio '{portfolio_id}'. Check your permissions.")
+            else:
+                raise ValueError(f"AWS API error ({error_code}): {error_message}")
                 
-                except KeyError as e:
-                    print(f"Warning: Could not process resource {resource_type}.{resource_name}: {e}")
-                    continue
+        except BotoCoreError as e:
+            raise ValueError(f"AWS connection error: {str(e)}")
     
-    # Sort import blocks based on dependencies
-    sorted_blocks = sort_import_blocks(import_blocks, dependencies)
-    return sorted_blocks
+    def find_product_by_name(self, products: List[Dict], product_name: str) -> Optional[Tuple[str, Dict]]:
+        """
+        Find a product by name in the list of products.
+        
+        Args:
+            products: List of product dictionaries
+            product_name: Name of the product to find
+            
+        Returns:
+            Tuple of (product_id, product_details) if found, None otherwise
+        """
+        if not product_name or not product_name.strip():
+            raise ValueError("Product name cannot be empty")
+        
+        product_name_lower = product_name.lower().strip()
+        
+        for product in products:
+            product_view = product.get('ProductViewSummary', {})
+            current_name = product_view.get('Name', '').lower().strip()
+            
+            if current_name == product_name_lower:
+                product_id = product_view.get('ProductId')
+                self.logger.info(f"Found product '{product_name}' with ID: {product_id}")
+                return product_id, product
+        
+        self.logger.warning(f"Product '{product_name}' not found in portfolio")
+        return None
 
-def sort_import_blocks(import_blocks, dependencies):
-    """
-    Sort import blocks based on their dependencies.
+
+def setup_logging(verbose: bool = False) -> None:
+    """Configure logging based on verbosity level."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+
+def print_products_table(products: List[Dict]) -> None:
+    """Print products in a formatted table."""
+    if not products:
+        print("No products found in the portfolio.")
+        return
     
-    Args:
-        import_blocks (list): List of import commands
-        dependencies (dict): Dictionary of resource dependencies
+    print(f"\n{'Product Name':<40} {'Product ID':<25} {'Type':<15}")
+    print("-" * 80)
     
-    Returns:
-        list: Sorted list of import commands
-    """
-    # Create a mapping of resource addresses to import blocks
-    address_to_block = {}
-    for block in import_blocks:
-        address = block.split(' ')[2]  # Get resource address from import command
-        address_to_block[address] = block
-    
-    # Sort based on dependencies
-    sorted_blocks = []
-    processed = set()
-    
-    def process_resource(address):
-        if address in processed:
-            return
+    for product in products:
+        product_view = product.get('ProductViewSummary', {})
+        name = product_view.get('Name', 'N/A')
+        product_id = product_view.get('ProductId', 'N/A')
+        product_type = product_view.get('Type', 'N/A')
         
-        # Process dependencies first
-        deps = dependencies.get(address, [])
-        for dep in deps:
-            if dep in address_to_block:
-                process_resource(dep)
-        
-        # Add the current resource
-        if address in address_to_block:
-            sorted_blocks.append(address_to_block[address])
-            processed.add(address)
-    
-    # Process all resources
-    for address in address_to_block:
-        process_resource(address)
-    
-    return sorted_blocks
+        # Truncate long names for table formatting
+        display_name = name[:37] + "..." if len(name) > 40 else name
+        print(f"{display_name:<40} {product_id:<25} {product_type:<15}")
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate Terraform import blocks from state file')
-    parser.add_argument('state_file', help='Path to the terraform.tfstate file')
-    parser.add_argument('-o', '--output', help='Output file for import blocks', default=None)
-    parser.add_argument('--module', help='Filter by specific module name', default=None)
+    """Main function to handle command line arguments and execute the script."""
+    parser = argparse.ArgumentParser(
+        description="Retrieve AWS Service Catalog products from a portfolio",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --portfolio-id port-1234567890 --product-name "My Product"
+  %(prog)s --portfolio-id port-1234567890 --list-all
+  %(prog)s --portfolio-id port-1234567890 --product-name "My Product" --region us-west-2 --verbose
+        """
+    )
+    
+    parser.add_argument(
+        '--portfolio-id',
+        required=True,
+        help='AWS Service Catalog Portfolio ID'
+    )
+    
+    parser.add_argument(
+        '--product-name',
+        help='Name of the product to find (case-insensitive)'
+    )
+    
+    parser.add_argument(
+        '--list-all',
+        action='store_true',
+        help='List all products in the portfolio'
+    )
+    
+    parser.add_argument(
+        '--region',
+        help='AWS region (default: uses AWS CLI default region)'
+    )
+    
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Enable verbose logging'
+    )
     
     args = parser.parse_args()
     
-    # Generate import blocks
-    import_blocks = generate_import_blocks(args.state_file)
+    # Validate arguments
+    if not args.product_name and not args.list_all:
+        parser.error("Either --product-name or --list-all must be specified")
     
-    # Filter by module if specified
-    if args.module:
-        import_blocks = [block for block in import_blocks if f'module.{args.module}.' in block]
+    setup_logging(args.verbose)
+    logger = logging.getLogger(__name__)
     
-    # Output handling
-    if import_blocks:
-        output = '#!/bin/bash\n\n# Generated Terraform import commands\n\n'
-        output += '\n'.join(import_blocks)
-        if args.output:
-            with open(args.output, 'w') as f:
-                f.write(output)
-            print(f"Import blocks written to {args.output}")
-        else:
-            print(output)
-    else:
-        print("No import blocks could be generated.")
+    try:
+        # Initialize Service Catalog client
+        sc_client = ServiceCatalogClient(region_name=args.region)
+        
+        # Retrieve products from portfolio
+        logger.info(f"Retrieving products from portfolio: {args.portfolio_id}")
+        products = sc_client.list_portfolio_products(args.portfolio_id)
+        
+        if args.list_all:
+            print_products_table(products)
+        
+        if args.product_name:
+            result = sc_client.find_product_by_name(products, args.product_name)
+            
+            if result:
+                product_id, product_details = result
+                print(f"\n✓ Product found!")
+                print(f"  Name: {args.product_name}")
+                print(f"  Product ID: {product_id}")
+                
+                if args.verbose:
+                    product_view = product_details.get('ProductViewSummary', {})
+                    print(f"  Type: {product_view.get('Type', 'N/A')}")
+                    print(f"  Owner: {product_view.get('Owner', 'N/A')}")
+                    print(f"  Short Description: {product_view.get('ShortDescription', 'N/A')}")
+            else:
+                print(f"\n✗ Product '{args.product_name}' not found in portfolio '{args.portfolio_id}'")
+                
+                # Suggest similar products
+                similar_products = [
+                    p.get('ProductViewSummary', {}).get('Name', '')
+                    for p in products
+                    if args.product_name.lower() in p.get('ProductViewSummary', {}).get('Name', '').lower()
+                ]
+                
+                if similar_products:
+                    print("\nSimilar products found:")
+                    for similar in similar_products[:5]:  # Show max 5 suggestions
+                        print(f"  - {similar}")
+                
+                sys.exit(1)
+    
+    except ValueError as e:
+        logger.error(f"Error: {str(e)}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("Operation cancelled by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        sys.exit(1)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
