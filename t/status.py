@@ -7,9 +7,29 @@ and retrieves error messages for products in error or tainted states.
 """
 
 
-def generate_provisioned_name(length=12):
-    valid_chars = string.ascii_lowercase + string.digits
-    return ''.join(random.choices(valid_chars, k=length))
+def _get_launch_path_id(self, product_id, preferred_portfolio=None):
+    response = self.sc_client.list_launch_paths(ProductId=product_id)
+    
+    if not response['LaunchPathSummaries']:
+        raise Exception(f"No launch paths found for product {product_id}")
+    
+    # If specific portfolio preferred, find it
+    if preferred_portfolio:
+        for path in response['LaunchPathSummaries']:
+            if preferred_portfolio.lower() in path['Name'].lower():
+                return path['Id']
+    
+    # Fallback logic - maybe select by naming convention
+    for path in response['LaunchPathSummaries']:
+        if 'production' in path['Name'].lower() or 'prod' in path['Name'].lower():
+            return path['Id']
+    
+    # If only one path, use it; if multiple, raise error for explicit choice
+    if len(response['LaunchPathSummaries']) == 1:
+        return response['LaunchPathSummaries'][0]['Id']
+    else:
+        available_paths = [p['Name'] for p in response['LaunchPathSummaries']]
+        raise Exception(f"Multiple launch paths available for {product_id}: {available_paths}. 
 
 import boto3
 import logging
