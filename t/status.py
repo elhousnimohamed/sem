@@ -6,6 +6,11 @@ This script checks the status of provisioned products in AWS Service Catalog
 and retrieves error messages for products in error or tainted states.
 """
 
+
+def generate_provisioned_name(length=12):
+    valid_chars = string.ascii_lowercase + string.digits
+    return ''.join(random.choices(valid_chars, k=length))
+
 import boto3
 import logging
 import sys
