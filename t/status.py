@@ -7,6 +7,20 @@ and retrieves error messages for products in error or tainted states.
 """
 
 
+def to_dict(self):
+        """Convert instance to JSON-serializable dictionary"""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "type": self.type,
+            "status": self.status,
+            "status_message": self.status_message,
+            "created_time": self.created_time.isoformat() if self.created_time else None,
+            "last_record_id": self.last_record_id,
+            "error_details": self.error_details
+        }
+
+
 def _get_launch_path_id(self, product_id, preferred_portfolio=None):
     response = self.sc_client.list_launch_paths(ProductId=product_id)
     
