@@ -86,8 +86,6 @@ func processRepository(config Config) error {
 	return nil
 }
 
-// cloneRepository clones the specified repository at the given tag
-/ cloneRepository clones the specified repository at the given tag
 func cloneRepository(config Config) (string, error) {
 	repoURL := fmt.Sprintf("https://github.com/%s/%s.git", config.Organization, config.Repository)
 	
@@ -99,67 +97,91 @@ func cloneRepository(config Config) (string, error) {
 
 	fmt.Printf("Cloning repository from %s to %s\n", repoURL, tempDir)
 
-	// Clone the repository
+	// Try to clone directly with the specific reference first
 	repo, err := git.PlainClone(tempDir, false, &git.CloneOptions{
-		URL:      repoURL,
-		Progress: os.Stdout,
+		URL:           repoURL,
+		Progress:      os.Stdout,
+		ReferenceName: plumbing.NewTagReferenceName(config.Tag),
+		SingleBranch:  true,
 	})
-	if err != nil {
-		cleanup(tempDir)
-		return "", fmt.Errorf("failed to clone repository: %w", err)
-	}
-
-	// Get the working tree
-	worktree, err := repo.Worktree()
-	if err != nil {
-		cleanup(tempDir)
-		return "", fmt.Errorf("failed to get worktree: %w", err)
-	}
-
-	// Checkout the specific tag
-	fmt.Printf("Checking out tag: %s\n", config.Tag)
 	
-	// First, try to resolve the tag to get its commit hash
-	tagRef := plumbing.NewTagReferenceName(config.Tag)
-	tagObject, err := repo.Reference(tagRef, true)
 	if err != nil {
-		// If tag reference fails, try resolving as a direct hash or lightweight tag
-		hash, hashErr := repo.ResolveRevision(plumbing.Revision(config.Tag))
-		if hashErr != nil {
-			// Try as a branch reference
-			branchRef := plumbing.NewBranchReferenceName(config.Tag)
-			err = worktree.Checkout(&git.CheckoutOptions{
-				Branch: branchRef,
-			})
-			if err != nil {
-				cleanup(tempDir)
-				return "", fmt.Errorf("failed to checkout tag/branch %s (tried tag, hash, and branch): tag_err=%v, hash_err=%v, branch_err=%v", 
-					config.Tag, err, hashErr, err)
-			}
-		} else {
-			// Checkout using the resolved hash
-			err = worktree.Checkout(&git.CheckoutOptions{
-				Hash: *hash,
-			})
-			if err != nil {
-				cleanup(tempDir)
-				return "", fmt.Errorf("failed to checkout commit %s: %w", hash.String(), err)
-			}
+		// If direct tag clone fails, clone the full repo and checkout manually
+		fmt.Printf("Direct tag clone failed, trying full clone and checkout: %v\n", err)
+		
+		// Remove the failed directory
+		os.RemoveAll(tempDir)
+		
+		// Create new temp directory
+		tempDir, err = os.MkdirTemp("", fmt.Sprintf("%s-%s-", config.Repository, config.Tag))
+		if err != nil {
+			return "", fmt.Errorf("failed to create temp directory: %w", err)
 		}
-	} else {
-		// Checkout using the tag reference
-		err = worktree.Checkout(&git.CheckoutOptions{
-			Hash: tagObject.Hash(),
+		
+		// Clone the repository without specifying a reference
+		repo, err = git.PlainClone(tempDir, false, &git.CloneOptions{
+			URL:      repoURL,
+			Progress: os.Stdout,
 		})
 		if err != nil {
 			cleanup(tempDir)
-			return "", fmt.Errorf("failed to checkout tag %s: %w", config.Tag, err)
+			return "", fmt.Errorf("failed to clone repository: %w", err)
+		}
+
+		// Get the working tree
+		worktree, err := repo.Worktree()
+		if err != nil {
+			cleanup(tempDir)
+			return "", fmt.Errorf("failed to get worktree: %w", err)
+		}
+
+		// Checkout the specific tag
+		fmt.Printf("Checking out tag: %s\n", config.Tag)
+		
+		// First, try to resolve the tag to get its commit hash
+		tagRef := plumbing.NewTagReferenceName(config.Tag)
+		tagObject, err := repo.Reference(tagRef, true)
+		if err != nil {
+			// If tag reference fails, try resolving as a direct hash or lightweight tag
+			hash, hashErr := repo.ResolveRevision(plumbing.Revision(config.Tag))
+			if hashErr != nil {
+				// Try as a branch reference
+				branchRef := plumbing.NewBranchReferenceName(config.Tag)
+				err = worktree.Checkout(&git.CheckoutOptions{
+					Branch: branchRef,
+					Force:  true, // Force checkout to override any unstaged changes
+				})
+				if err != nil {
+					cleanup(tempDir)
+					return "", fmt.Errorf("failed to checkout tag/branch %s (tried tag, hash, and branch): tag_err=%v, hash_err=%v, branch_err=%v", 
+						config.Tag, err, hashErr, err)
+				}
+			} else {
+				// Checkout using the resolved hash
+				err = worktree.Checkout(&git.CheckoutOptions{
+					Hash:  *hash,
+					Force: true, // Force checkout to override any unstaged changes
+				})
+				if err != nil {
+					cleanup(tempDir)
+					return "", fmt.Errorf("failed to checkout commit %s: %w", hash.String(), err)
+				}
+			}
+		} else {
+			// Checkout using the tag reference
+			err = worktree.Checkout(&git.CheckoutOptions{
+				Hash:  tagObject.Hash(),
+				Force: true, // Force checkout to override any unstaged changes
+			})
+			if err != nil {
+				cleanup(tempDir)
+				return "", fmt.Errorf("failed to checkout tag %s: %w", config.Tag, err)
+			}
 		}
 	}
 
 	return tempDir, nil
 }
-
 // validateDirectory checks if the specified directory exists
 func validateDirectory(path string) error {
 	info, err := os.Stat(path)
