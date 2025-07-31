@@ -87,6 +87,7 @@ func processRepository(config Config) error {
 }
 
 // cloneRepository clones the specified repository at the given tag
+/ cloneRepository clones the specified repository at the given tag
 func cloneRepository(config Config) (string, error) {
 	repoURL := fmt.Sprintf("https://github.com/%s/%s.git", config.Organization, config.Repository)
 	
@@ -116,21 +117,43 @@ func cloneRepository(config Config) (string, error) {
 	}
 
 	// Checkout the specific tag
-	tagRef := plumbing.NewTagReferenceName(config.Tag)
 	fmt.Printf("Checking out tag: %s\n", config.Tag)
 	
-	err = worktree.Checkout(&git.CheckoutOptions{
-		Branch: tagRef,
-	})
+	// First, try to resolve the tag to get its commit hash
+	tagRef := plumbing.NewTagReferenceName(config.Tag)
+	tagObject, err := repo.Reference(tagRef, true)
 	if err != nil {
-		// Try checking out as a branch reference if tag checkout fails
-		branchRef := plumbing.NewBranchReferenceName(config.Tag)
+		// If tag reference fails, try resolving as a direct hash or lightweight tag
+		hash, hashErr := repo.ResolveRevision(plumbing.Revision(config.Tag))
+		if hashErr != nil {
+			// Try as a branch reference
+			branchRef := plumbing.NewBranchReferenceName(config.Tag)
+			err = worktree.Checkout(&git.CheckoutOptions{
+				Branch: branchRef,
+			})
+			if err != nil {
+				cleanup(tempDir)
+				return "", fmt.Errorf("failed to checkout tag/branch %s (tried tag, hash, and branch): tag_err=%v, hash_err=%v, branch_err=%v", 
+					config.Tag, err, hashErr, err)
+			}
+		} else {
+			// Checkout using the resolved hash
+			err = worktree.Checkout(&git.CheckoutOptions{
+				Hash: *hash,
+			})
+			if err != nil {
+				cleanup(tempDir)
+				return "", fmt.Errorf("failed to checkout commit %s: %w", hash.String(), err)
+			}
+		}
+	} else {
+		// Checkout using the tag reference
 		err = worktree.Checkout(&git.CheckoutOptions{
-			Branch: branchRef,
+			Hash: tagObject.Hash(),
 		})
 		if err != nil {
 			cleanup(tempDir)
-			return "", fmt.Errorf("failed to checkout tag/branch %s: %w", config.Tag, err)
+			return "", fmt.Errorf("failed to checkout tag %s: %w", config.Tag, err)
 		}
 	}
 
