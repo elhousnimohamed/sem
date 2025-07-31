@@ -244,8 +244,30 @@ func extractWithHCL(filePath string) ([]ProvisioningParameter, error) {
 			
 			fmt.Printf("Found aws_servicecatalog_provisioned_product resource: %s\n", block.Labels[1])
 			
-			// Look for provisioning_parameters attribute
+			// Look for provisioning_parameters block (not attribute)
+			for _, nestedBlock := range block.Body.Blocks {
+				if nestedBlock.Type == "provisioning_parameters" {
+					fmt.Printf("Found provisioning_parameters block\n")
+					
+					// Extract parameters from the nested block
+					for key, attr := range nestedBlock.Body.Attributes {
+						value, err := extractStringFromExpr(attr.Expr)
+						if err != nil {
+							fmt.Printf("Warning: failed to extract value for key %s: %v\n", key, err)
+							continue
+						}
+						
+						parameters = append(parameters, ProvisioningParameter{
+							Key:   key,
+							Value: value,
+						})
+					}
+				}
+			}
+			
+			// Also check for provisioning_parameters as an attribute (map/object format)
 			if attr, exists := block.Body.Attributes["provisioning_parameters"]; exists {
+				fmt.Printf("Found provisioning_parameters attribute\n")
 				params, err := parseProvisioningParametersFromHCL(attr)
 				if err != nil {
 					fmt.Printf("Warning: failed to parse provisioning_parameters: %v\n", err)
@@ -258,7 +280,6 @@ func extractWithHCL(filePath string) ([]ProvisioningParameter, error) {
 
 	return parameters, nil
 }
-
 // parseProvisioningParametersFromHCL extracts parameters from HCL attribute
 func parseProvisioningParametersFromHCL(attr *hclsyntax.Attribute) ([]ProvisioningParameter, error) {
 	var parameters []ProvisioningParameter
