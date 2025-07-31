@@ -247,11 +247,27 @@ func extractStringFromExpr(expr hclsyntax.Expression) (string, error) {
 	case *hclsyntax.LiteralValueExpr:
 		return e.Val.AsString(), nil
 	case *hclsyntax.TemplateExpr:
-		// Handle template expressions by extracting the raw text
-		return string(e.Range().SliceBytes(e.Range().Filename)), nil
+		// For template expressions, try to extract parts or return a placeholder
+		if len(e.Parts) > 0 {
+			// If it's a simple template with one literal part, extract it
+			if len(e.Parts) == 1 {
+				if litExpr, ok := e.Parts[0].(*hclsyntax.LiteralValueExpr); ok {
+					return litExpr.Val.AsString(), nil
+				}
+			}
+		}
+		// For complex templates, return a representation
+		return fmt.Sprintf("${...template...}"), nil
+	case *hclsyntax.ScopeTraversalExpr:
+		// Handle variable references like var.something
+		return e.Traversal.RootName(), nil
+	case *hclsyntax.FunctionCallExpr:
+		// Handle function calls
+		return fmt.Sprintf("%s(...)", e.Name), nil
 	default:
-		// For other expressions, return the source text
-		return string(expr.Range().SliceBytes(expr.Range().Filename)), nil
+		// For other expressions, we can't easily extract the value
+		// Return a generic placeholder or the expression type
+		return fmt.Sprintf("<%T>", expr), nil
 	}
 }
 
