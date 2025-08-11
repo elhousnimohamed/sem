@@ -1,66 +1,77 @@
 package main
 
 import (
-	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
+    "encoding/json"
+    "fmt"
+    "log"
+    "os"
+    "strings"
 
-	"github.com/hashicorp/terraform-config-inspect/tfconfig"
+    "github.com/hashicorp/hcl/v2"
+    "github.com/hashicorp/hcl/v2/hclwrite"
 )
 
-type ModuleInfo struct {
-	Name   string
-	Source string
-}
-
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Println("Usage: go run main.go <image_template>")
-		fmt.Println("Example: go run main.go EC2MutableRedhat8Base")
-		os.Exit(1)
-	}
+    if len(os.Args) != 2 {
+        log.Fatalf("Usage: %s <image_template>\n", os.Args[0])
+    }
+    imageTemplate := os.Args[1]
 
-	imageTemplate := os.Args[1]
-	
-	moduleInfo, err := findModuleByImageTemplate(".", imageTemplate)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
-	}
+    // Read the Terraform file from disk
+    data, err := os.ReadFile("main.tf")
+    if err != nil {
+        log.Fatalf("Failed to read main.tf: %v", err)
+    }
 
-	if moduleInfo == nil {
-		fmt.Printf("No module found for image_template: %s\n", imageTemplate)
-		os.Exit(1)
-	}
+    // Parse the file into an hclwrite.File AST
+    file, diags := hclwrite.ParseConfig(data, "main.tf", hcl.Pos{Line: 1, Column: 1})
+    if diags.HasErrors() {
+        log.Fatalf("Failed to parse HCL: %s", diags)
+    }
 
-	fmt.Printf("Module Name: %s\n", moduleInfo.Name)
-	fmt.Printf("Source: %s\n", moduleInfo.Source)
-}
+    // Iterate over all top-level blocks in the file
+    for _, block := range file.Body().Blocks() {
+        if block.Type() != "module" {
+            continue
+        }
+        labels := block.Labels()
+        if len(labels) == 0 {
+            continue
+        }
+        moduleName := labels[0]
+        body := block.Body()
 
-func findModuleByImageTemplate(configPath, imageTemplate string) (*ModuleInfo, error) {
-	// Load the Terraform module configuration
-	module, diags := tfconfig.LoadModule(configPath)
-	if diags.HasErrors() {
-		return nil, fmt.Errorf("failed to load Terraform module: %s", diags.Error())
-	}
+        // Get the source attribute (module source path)
+        srcAttr := body.GetAttribute("source")
+        if srcAttr == nil {
+            continue
+        }
+        // BuildTokens converts the attribute value back to text
+        sourceTokens := srcAttr.Expr().BuildTokens(nil)
+        sourceValue := string(hclwrite.Tokens(sourceTokens).Bytes())
 
-	// Iterate through all module calls
-	for name, moduleCall := range module.ModuleCalls {
-		// Print the moduleCall structure to debug
-		fmt.Printf("Debug - Module: %s, Source: %s\n", name, moduleCall.Source)
-		fmt.Printf("Debug - ModuleCall fields: %+v\n", moduleCall)
-		
-		// Check if the module source or name contains our image template pattern
-		// This is a simple fallback approach
-		if strings.Contains(strings.ToLower(name), strings.ToLower(imageTemplate)) ||
-		   strings.Contains(strings.ToLower(moduleCall.Source), strings.ToLower(imageTemplate)) {
-			return &ModuleInfo{
-				Name:   name,
-				Source: moduleCall.Source,
-			}, nil
-		}
-	}
+        // Get the count attribute (contains the image_template condition)
+        countAttr := body.GetAttribute("count")
+        if countAttr == nil {
+            continue
+        }
+        countTokens := countAttr.Expr().BuildTokens(nil)
+        countValue := string(hclwrite.Tokens(countTokens).Bytes())
 
-	return nil, nil
+        // Check if the count expression contains the image template string (with quotes)
+        if strings.Contains(countValue, fmt.Sprintf(`"%s"`, imageTemplate)) {
+            // Found the matching module; output as JSON
+            result := map[string]string{
+                "module_name": moduleName,
+                "source":      sourceValue,
+            }
+            out, err := json.MarshalIndent(result, "", "  ")
+            if err != nil {
+                log.Fatalf("JSON marshal error: %v", err)
+            }
+            fmt.Println(string(out))
+            return
+        }
+    }
+    log.Printf("No module found for image_template %q", imageTemplate)
 }
