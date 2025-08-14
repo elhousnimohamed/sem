@@ -96,14 +96,18 @@ func processModuleBlock(moduleBlock *hclwrite.Block) bool {
 		return false
 	}
 
-	// Create a new object expression with modified values
-	newItems := make([]hclwrite.ObjectAttrTokens, 0)
+	// Build new object manually with tokens
+	tokens := hclwrite.Tokens{}
+	tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenOBrace, Bytes: []byte("{")})
+	
 	found := false
 	
 	// Process existing items
 	for _, item := range objExpr.Items {
-		keyTokens := hclwrite.TokensForTraversal(item.KeyExpr.(*hclsyntax.ScopeTraversalExpr).Traversal)
-		keyName := string(keyTokens.Bytes())
+		tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
+		
+		// Get key name
+		keyName := getKeyName(item.KeyExpr)
 		
 		if keyName == "ec2_unlock_termination_protection" {
 			found = true
@@ -111,43 +115,27 @@ func processModuleBlock(moduleBlock *hclwrite.Block) bool {
 			currentValue := extractNumericValue(item.ValueExpr)
 			newValue := currentValue + 1
 			
-			newItems = append(newItems, hclwrite.ObjectAttrTokens{
-				Name:  hclwrite.Tokens{&hclwrite.Token{Type: hclsyntax.TokenIdent, Bytes: []byte("ec2_unlock_termination_protection")}},
-				Equals: &hclwrite.Token{Type: hclsyntax.TokenEqual, Bytes: []byte("=")},
-				Value: hclwrite.TokensForValue(cty.NumberIntVal(int64(newValue))),
-			})
+			// Add key
+			tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenIdent, Bytes: []byte("ec2_unlock_termination_protection")})
+			tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenEqual, Bytes: []byte("=")})
+			tokens = append(tokens, hclwrite.TokensForValue(cty.NumberIntVal(int64(newValue)))...)
 		} else {
-			// Copy existing item
+			// Copy existing item as-is
+			keyTokens := buildTokensFromExpr(item.KeyExpr)
 			valueTokens := buildTokensFromExpr(item.ValueExpr)
-			newItems = append(newItems, hclwrite.ObjectAttrTokens{
-				Name:   keyTokens,
-				Equals: &hclwrite.Token{Type: hclsyntax.TokenEqual, Bytes: []byte("=")},
-				Value:  valueTokens,
-			})
+			
+			tokens = append(tokens, keyTokens...)
+			tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenEqual, Bytes: []byte("=")})
+			tokens = append(tokens, valueTokens...)
 		}
 	}
 	
 	// If not found, add new item
 	if !found {
-		newItems = append(newItems, hclwrite.ObjectAttrTokens{
-			Name:  hclwrite.Tokens{&hclwrite.Token{Type: hclsyntax.TokenIdent, Bytes: []byte("ec2_unlock_termination_protection")}},
-			Equals: &hclwrite.Token{Type: hclsyntax.TokenEqual, Bytes: []byte("=")},
-			Value: hclwrite.TokensForValue(cty.NumberIntVal(1)),
-		})
-	}
-
-	// Create new object expression tokens manually
-	tokens := hclwrite.Tokens{}
-	tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenOBrace, Bytes: []byte("{")})
-	
-	for i, item := range newItems {
-		if i > 0 {
-			tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
-		}
 		tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
-		tokens = append(tokens, item.Name...)
-		tokens = append(tokens, item.Equals)
-		tokens = append(tokens, item.Value...)
+		tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenIdent, Bytes: []byte("ec2_unlock_termination_protection")})
+		tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenEqual, Bytes: []byte("=")})
+		tokens = append(tokens, hclwrite.TokensForValue(cty.NumberIntVal(1))...)
 	}
 	
 	tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
@@ -156,6 +144,22 @@ func processModuleBlock(moduleBlock *hclwrite.Block) bool {
 	moduleBody.SetAttributeRaw("parameter_group", tokens)
 	
 	return true
+}
+
+func getKeyName(expr hclsyntax.Expression) string {
+	switch e := expr.(type) {
+	case *hclsyntax.ObjectConsKeyExpr:
+		if scopeExpr, ok := e.Wrapped.(*hclsyntax.ScopeTraversalExpr); ok {
+			if len(scopeExpr.Traversal) > 0 {
+				return scopeExpr.Traversal[0].(hcl.TraverseRoot).Name
+			}
+		}
+	case *hclsyntax.ScopeTraversalExpr:
+		if len(e.Traversal) > 0 {
+			return e.Traversal[0].(hcl.TraverseRoot).Name
+		}
+	}
+	return ""
 }
 
 func extractNumericValue(expr hclsyntax.Expression) int {
