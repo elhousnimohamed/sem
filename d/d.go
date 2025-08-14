@@ -136,9 +136,24 @@ func processModuleBlock(moduleBlock *hclwrite.Block) bool {
 		})
 	}
 
-	// Create new object expression
-	newExpr := hclwrite.NewExpressionObjectCons(newItems)
-	moduleBody.SetAttributeRaw("parameter_group", newExpr.BuildTokens(nil))
+	// Create new object expression tokens manually
+	tokens := hclwrite.Tokens{}
+	tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenOBrace, Bytes: []byte("{")})
+	
+	for i, item := range newItems {
+		if i > 0 {
+			tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
+		}
+		tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
+		tokens = append(tokens, item.Name...)
+		tokens = append(tokens, item.Equals)
+		tokens = append(tokens, item.Value...)
+	}
+	
+	tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
+	tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenCBrace, Bytes: []byte("}")})
+	
+	moduleBody.SetAttributeRaw("parameter_group", tokens)
 	
 	return true
 }
