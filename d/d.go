@@ -78,12 +78,14 @@ func processModuleBlock(moduleBlock *hclwrite.Block) bool {
 		return false
 	}
 
-	// Get the expression value
-	expr := paramGroupAttr.Expr()
+	// Get the raw tokens from the original expression
+	originalTokens := paramGroupAttr.Expr().BuildTokens(nil)
+	
+	// Convert to string and back to work with it
+	originalSource := string(hclwrite.Format(originalTokens.Bytes()))
 	
 	// Parse the expression as HCL syntax to work with it
-	src := hclwrite.Format(expr.BuildTokens(nil).Bytes())
-	parsed, diags := hclsyntax.ParseExpression(src, "", hcl.Pos{Line: 1, Column: 1})
+	parsed, diags := hclsyntax.ParseExpression([]byte(originalSource), "", hcl.Pos{Line: 1, Column: 1})
 	if diags.HasErrors() {
 		fmt.Fprintf(os.Stderr, "Error parsing parameter_group expression: %v\n", diags)
 		return false
@@ -96,54 +98,64 @@ func processModuleBlock(moduleBlock *hclwrite.Block) bool {
 		return false
 	}
 
-	// Build new object manually with tokens
-	tokens := hclwrite.Tokens{}
-	tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenOBrace, Bytes: []byte("{")})
+	// Build the new source string manually by modifying the original
+	newSource := modifyObjectSource(originalSource, objExpr)
 	
+	// Parse the new source and set it
+	newTokens, diags := hclwrite.ParseConfig([]byte("attr = " + newSource), "", hcl.Pos{Line: 1, Column: 1})
+	if diags.HasErrors() {
+		fmt.Fprintf(os.Stderr, "Error parsing new expression: %v\n", diags)
+		return false
+	}
+	
+	// Get the attribute from the parsed config and use its expression
+	tempAttr := newTokens.Body().GetAttribute("attr")
+	if tempAttr != nil {
+		moduleBody.SetAttributeRaw("parameter_group", tempAttr.Expr().BuildTokens(nil))
+	}
+	
+	return true
+}
+
+func modifyObjectSource(originalSource string, objExpr *hclsyntax.ObjectConsExpr) string {
+	// This is a simple string-based approach
+	// Remove the outer braces temporarily
+	source := strings.TrimSpace(originalSource)
+	if strings.HasPrefix(source, "{") && strings.HasSuffix(source, "}") {
+		source = strings.TrimSpace(source[1 : len(source)-1])
+	}
+	
+	lines := strings.Split(source, "\n")
 	found := false
 	
-	// Process existing items
-	for _, item := range objExpr.Items {
-		tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
-		
-		// Get key name
-		keyName := getKeyName(item.KeyExpr)
-		
-		if keyName == "ec2_unlock_termination_protection" {
+	// Look for ec2_unlock_termination_protection in each line
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "ec2_unlock_termination_protection") {
 			found = true
-			// Get current value and increment it
-			currentValue := extractNumericValue(item.ValueExpr)
-			newValue := currentValue + 1
-			
-			// Add key
-			tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenIdent, Bytes: []byte("ec2_unlock_termination_protection")})
-			tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenEqual, Bytes: []byte("=")})
-			tokens = append(tokens, hclwrite.TokensForValue(cty.NumberIntVal(int64(newValue)))...)
-		} else {
-			// Copy existing item as-is
-			keyTokens := buildTokensFromExpr(item.KeyExpr)
-			valueTokens := buildTokensFromExpr(item.ValueExpr)
-			
-			tokens = append(tokens, keyTokens...)
-			tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenEqual, Bytes: []byte("=")})
-			tokens = append(tokens, valueTokens...)
+			// Extract the current value and increment it
+			parts := strings.Split(trimmed, "=")
+			if len(parts) == 2 {
+				valueStr := strings.TrimSpace(parts[1])
+				if currentValue, err := strconv.Atoi(valueStr); err == nil {
+					lines[i] = strings.Replace(line, valueStr, strconv.Itoa(currentValue+1), 1)
+				}
+			}
+			break
 		}
 	}
 	
-	// If not found, add new item
+	// If not found, add it
 	if !found {
-		tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
-		tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenIdent, Bytes: []byte("ec2_unlock_termination_protection")})
-		tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenEqual, Bytes: []byte("=")})
-		tokens = append(tokens, hclwrite.TokensForValue(cty.NumberIntVal(1))...)
+		if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) != "" {
+			lines = append(lines, "ec2_unlock_termination_protection=1")
+		} else {
+			lines = append(lines, "ec2_unlock_termination_protection=1")
+		}
 	}
 	
-	tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
-	tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenCBrace, Bytes: []byte("}")})
-	
-	moduleBody.SetAttributeRaw("parameter_group", tokens)
-	
-	return true
+	// Reconstruct the object
+	return "{\n" + strings.Join(lines, "\n") + "\n}"
 }
 
 func getKeyName(expr hclsyntax.Expression) string {
@@ -189,8 +201,17 @@ func buildTokensFromExpr(expr hclsyntax.Expression) hclwrite.Tokens {
 			&hclwrite.Token{Type: hclsyntax.TokenCQuote, Bytes: []byte(`"`)}}
 	case *hclsyntax.ScopeTraversalExpr:
 		return hclwrite.TokensForTraversal(e.Traversal)
+	case *hclsyntax.ObjectConsKeyExpr:
+		// This is for object keys - unwrap the expression
+		return buildTokensFromExpr(e.Wrapped)
 	default:
-		// Fallback: try to render the expression as-is
+		// Fallback: try to get the source range and extract the text
+		// This is a last resort but should preserve the original syntax
+		if expr.Range() != nil && expr.Range().Filename != "" {
+			// If we have source information, we could try to extract it
+			// For now, just return a placeholder that indicates the issue
+			return hclwrite.Tokens{&hclwrite.Token{Type: hclsyntax.TokenIdent, Bytes: []byte("unknown_expr")}}
+		}
 		return hclwrite.Tokens{&hclwrite.Token{Type: hclsyntax.TokenIdent, Bytes: []byte("unknown")}}
 	}
 }
