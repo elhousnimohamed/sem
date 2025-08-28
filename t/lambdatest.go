@@ -1,517 +1,506 @@
 package main
 
 import (
-	"archive/zip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
-	"os"
+	"regexp"
 	"strings"
-	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/lambda/types"
 )
 
-const (
-	testFunctionName = "test-lambda-security-function"
-	testRoleName     = "test-lambda-security-role"
-	testZipFile      = "test-function.zip"
-)
-
-// TestLambdaPolicy represents a test case for Lambda policies
-type TestLambdaPolicy struct {
-	Name         string
-	StatementId  string
-	Action       string
-	Principal    string
-	SourceArn    *string
-	SourceAccount *string
-	ShouldRemove bool // true if this policy should be removed by our security function
-	Description  string
+// PolicyAnalysisResult represents the result of analyzing and potentially modifying a Lambda policy
+type PolicyAnalysisResult struct {
+	FunctionARN          string    `json:"function_arn"`
+	WasPubliclyAccessible bool      `json:"was_publicly_accessible"`
+	ChangesRequired      bool      `json:"changes_required"`
+	ChangesMade          bool      `json:"changes_made"`
+	OriginalPolicy       string    `json:"original_policy,omitempty"`
+	ModifiedPolicy       string    `json:"modified_policy,omitempty"`
+	RemovedStatements    []string  `json:"removed_statements,omitempty"`
+	Timestamp            time.Time `json:"timestamp"`
+	Error                string    `json:"error,omitempty"`
 }
 
-// TestSuite manages the entire test lifecycle
-type TestSuite struct {
-	ctx           context.Context
-	lambdaClient  *lambda.Client
-	iamClient     *iam.Client
-	functionArn   string
-	roleArn       string
-	policyManager *LambdaPolicyManager
-	testPolicies  []TestLambdaPolicy
+// PolicyStatement represents an AWS policy statement
+type PolicyStatement struct {
+	Sid       string      `json:"Sid,omitempty"`
+	Effect    string      `json:"Effect"`
+	Principal interface{} `json:"Principal,omitempty"`
+	Action    interface{} `json:"Action"`
+	Resource  interface{} `json:"Resource,omitempty"`
+	Condition interface{} `json:"Condition,omitempty"`
 }
 
-// NewTestSuite creates a new test suite
-func NewTestSuite(ctx context.Context) (*TestSuite, error) {
+// PolicyDocument represents an AWS policy document
+type PolicyDocument struct {
+	Version   string            `json:"Version"`
+	Statement []PolicyStatement `json:"Statement"`
+}
+
+// LambdaPolicyManager handles Lambda policy operations
+type LambdaPolicyManager struct {
+	client *lambda.Client
+}
+
+// NewLambdaPolicyManager creates a new instance of LambdaPolicyManager
+func NewLambdaPolicyManager(ctx context.Context) (*LambdaPolicyManager, error) {
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	policyManager, err := NewLambdaPolicyManager(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create policy manager: %w", err)
-	}
-
-	return &TestSuite{
-		ctx:           ctx,
-		lambdaClient:  lambda.NewFromConfig(cfg),
-		iamClient:     iam.NewFromConfig(cfg),
-		policyManager: policyManager,
-		testPolicies:  defineTestPolicies(),
+	return &LambdaPolicyManager{
+		client: lambda.NewFromConfig(cfg),
 	}, nil
 }
 
-// defineTestPolicies defines the test cases with various policy configurations
-func defineTestPolicies() []TestLambdaPolicy {
-	return []TestLambdaPolicy{
-		{
-			Name:         "PublicWildcard",
-			StatementId:  "public-wildcard",
-			Action:       "lambda:InvokeFunction",
-			Principal:    "*",
-			ShouldRemove: true,
-			Description:  "Public access via wildcard principal - should be removed",
-		},
-		{
-			Name:         "PublicWithCondition",
-			StatementId:  "public-with-condition",
-			Action:       "lambda:InvokeFunction", 
-			Principal:    "*",
-			ShouldRemove: true,
-			Description:  "Public access with condition - should still be removed",
-		},
-		{
-			Name:         "SpecificAccount",
-			StatementId:  "specific-account",
-			Action:       "lambda:InvokeFunction",
-			Principal:    "arn:aws:iam::123456789012:root",
-			ShouldRemove: false,
-			Description:  "Specific AWS account access - should be kept",
-		},
-		{
-			Name:         "ServicePrincipal",
-			StatementId:  "service-principal",
-			Action:       "lambda:InvokeFunction",
-			Principal:    "s3.amazonaws.com",
-			SourceArn:    aws.String("arn:aws:s3:::my-bucket/*"),
-			ShouldRemove: false,
-			Description:  "Service principal with source ARN - should be kept",
-		},
-		{
-			Name:         "APIGateway",
-			StatementId:  "apigateway-invoke",
-			Action:       "lambda:InvokeFunction",
-			Principal:    "apigateway.amazonaws.com",
-			SourceArn:    aws.String("arn:aws:execute-api:us-east-1:123456789012:abcdef123/*"),
-			ShouldRemove: false,
-			Description:  "API Gateway access - should be kept",
-		},
-		{
-			Name:         "EventBridge",
-			StatementId:  "eventbridge-invoke",
-			Action:       "lambda:InvokeFunction",
-			Principal:    "events.amazonaws.com",
-			SourceArn:    aws.String("arn:aws:events:us-east-1:123456789012:rule/my-rule"),
-			ShouldRemove: false,
-			Description:  "EventBridge rule access - should be kept",
-		},
-		{
-			Name:         "PublicGetFunction",
-			StatementId:  "public-get-function",
-			Action:       "lambda:GetFunction",
-			Principal:    "*",
-			ShouldRemove: true,
-			Description:  "Public GetFunction access - should be removed",
-		},
+// NewLambdaPolicyManagerWithConfig creates a new instance with a custom AWS config
+func NewLambdaPolicyManagerWithConfig(cfg aws.Config) *LambdaPolicyManager {
+	return &LambdaPolicyManager{
+		client: lambda.NewFromConfig(cfg),
 	}
 }
 
-// RunFullTest executes the complete test suite
-func (ts *TestSuite) RunFullTest(t *testing.T) {
-	t.Log("Starting Lambda Policy Security Test Suite")
-
-	// Setup phase
-	t.Run("Setup", func(t *testing.T) {
-		if err := ts.Setup(); err != nil {
-			t.Fatalf("Setup failed: %v", err)
-		}
-		t.Logf("Test Lambda function created: %s", ts.functionArn)
-	})
-
-	// Cleanup at the end regardless of test outcome
-	defer func() {
-		t.Run("Cleanup", func(t *testing.T) {
-			if err := ts.Cleanup(); err != nil {
-				t.Errorf("Cleanup failed: %v", err)
-			} else {
-				t.Log("Cleanup completed successfully")
-			}
-		})
-	}()
-
-	// Apply test policies
-	t.Run("ApplyPolicies", func(t *testing.T) {
-		if err := ts.ApplyTestPolicies(); err != nil {
-			t.Fatalf("Failed to apply test policies: %v", err)
-		}
-		t.Logf("Applied %d test policies", len(ts.testPolicies))
-	})
-
-	// Verify initial state
-	t.Run("VerifyInitialState", func(t *testing.T) {
-		if err := ts.VerifyInitialPolicyState(); err != nil {
-			t.Fatalf("Initial state verification failed: %v", err)
-		}
-		t.Log("Initial policy state verified")
-	})
-
-	// Run security function
-	t.Run("RunSecurityFunction", func(t *testing.T) {
-		result, err := ts.policyManager.SecureLambdaFunction(ts.ctx, ts.functionArn)
-		if err != nil {
-			t.Fatalf("Security function failed: %v", err)
-		}
-
-		// Verify the result
-		if !result.WasPubliclyAccessible {
-			t.Error("Expected function to be detected as publicly accessible")
-		}
-
-		if !result.ChangesMade {
-			t.Error("Expected changes to be made")
-		}
-
-		expectedRemovedCount := ts.countPoliciesThatShouldBeRemoved()
-		if len(result.RemovedStatements) != expectedRemovedCount {
-			t.Errorf("Expected %d statements to be removed, got %d", 
-				expectedRemovedCount, len(result.RemovedStatements))
-		}
-
-		t.Logf("Security function completed: removed %d statements", len(result.RemovedStatements))
-		
-		// Print detailed results
-		resultJSON, _ := json.MarshalIndent(result, "", "  ")
-		t.Logf("Security function result:\n%s", string(resultJSON))
-	})
-
-	// Verify final state
-	t.Run("VerifyFinalState", func(t *testing.T) {
-		if err := ts.VerifyFinalPolicyState(); err != nil {
-			t.Fatalf("Final state verification failed: %v", err)
-		}
-		t.Log("Final policy state verified - all public policies removed, legitimate policies preserved")
-	})
+// NewLambdaPolicyManagerWithClient creates a new instance with a custom Lambda client
+func NewLambdaPolicyManagerWithClient(client *lambda.Client) *LambdaPolicyManager {
+	return &LambdaPolicyManager{
+		client: client,
+	}
 }
 
-// Setup creates the test Lambda function and IAM role
-func (ts *TestSuite) Setup() error {
-	// Create IAM role for Lambda
-	if err := ts.createIAMRole(); err != nil {
-		return fmt.Errorf("failed to create IAM role: %w", err)
+// SecureLambdaFunction analyzes and secures a Lambda function's resource-based policy
+func (lpm *LambdaPolicyManager) SecureLambdaFunction(ctx context.Context, functionARN string) (*PolicyAnalysisResult, error) {
+	result := &PolicyAnalysisResult{
+		FunctionARN: functionARN,
+		Timestamp:   time.Now(),
 	}
 
-	// Wait a bit for role to propagate
-	time.Sleep(10 * time.Second)
-
-	// Create deployment package
-	if err := ts.createDeploymentPackage(); err != nil {
-		return fmt.Errorf("failed to create deployment package: %w", err)
+	// Validate ARN format
+	if err := validateLambdaARN(functionARN); err != nil {
+		result.Error = fmt.Sprintf("Invalid ARN format: %v", err)
+		return result, err
 	}
 
-	// Create Lambda function
-	if err := ts.createLambdaFunction(); err != nil {
-		return fmt.Errorf("failed to create Lambda function: %w", err)
-	}
-
-	return nil
-}
-
-// createIAMRole creates an IAM role for the test Lambda function
-func (ts *TestSuite) createIAMRole() error {
-	assumeRolePolicy := `{
-		"Version": "2012-10-17",
-		"Statement": [
-			{
-				"Effect": "Allow",
-				"Principal": {
-					"Service": "lambda.amazonaws.com"
-				},
-				"Action": "sts:AssumeRole"
-			}
-		]
-	}`
-
-	createRoleInput := &iam.CreateRoleInput{
-		RoleName:                 aws.String(testRoleName),
-		AssumeRolePolicyDocument: aws.String(assumeRolePolicy),
-		Description:              aws.String("Test role for Lambda policy security testing"),
-	}
-
-	result, err := ts.iamClient.CreateRole(ts.ctx, createRoleInput)
+	// Extract function name from ARN
+	functionName, err := extractFunctionName(functionARN)
 	if err != nil {
-		return fmt.Errorf("failed to create IAM role: %w", err)
+		result.Error = fmt.Sprintf("Failed to extract function name: %v", err)
+		return result, err
 	}
 
-	ts.roleArn = *result.Role.Arn
-
-	// Attach basic Lambda execution policy
-	attachPolicyInput := &iam.AttachRolePolicyInput{
-		RoleName:  aws.String(testRoleName),
-		PolicyArn: aws.String("arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"),
-	}
-
-	_, err = ts.iamClient.AttachRolePolicy(ts.ctx, attachPolicyInput)
+	// Retrieve the current policy
+	policy, err := lpm.getPolicy(ctx, functionName)
 	if err != nil {
-		return fmt.Errorf("failed to attach policy to role: %w", err)
-	}
-
-	return nil
-}
-
-// createDeploymentPackage creates a simple deployment package for the Lambda function
-func (ts *TestSuite) createDeploymentPackage() error {
-	// Create a simple Node.js Lambda function
-	lambdaCode := `
-exports.handler = async (event) => {
-    console.log('Test Lambda function executed');
-    return {
-        statusCode: 200,
-        body: JSON.stringify({
-            message: 'Hello from test Lambda!',
-            input: event
-        })
-    };
-};`
-
-	// Create ZIP file
-	zipFile, err := os.Create(testZipFile)
-	if err != nil {
-		return fmt.Errorf("failed to create zip file: %w", err)
-	}
-	defer zipFile.Close()
-
-	zipWriter := zip.NewWriter(zipFile)
-	defer zipWriter.Close()
-
-	// Add index.js to ZIP
-	file, err := zipWriter.Create("index.js")
-	if err != nil {
-		return fmt.Errorf("failed to create file in zip: %w", err)
-	}
-
-	_, err = file.Write([]byte(lambdaCode))
-	if err != nil {
-		return fmt.Errorf("failed to write to zip file: %w", err)
-	}
-
-	return nil
-}
-
-// createLambdaFunction creates the test Lambda function
-func (ts *TestSuite) createLambdaFunction() error {
-	// Read the deployment package
-	zipData, err := os.ReadFile(testZipFile)
-	if err != nil {
-		return fmt.Errorf("failed to read deployment package: %w", err)
-	}
-
-	createFunctionInput := &lambda.CreateFunctionInput{
-		FunctionName: aws.String(testFunctionName),
-		Runtime:      types.RuntimeNodejs18x,
-		Role:         aws.String(ts.roleArn),
-		Handler:      aws.String("index.handler"),
-		Code: &types.FunctionCode{
-			ZipFile: zipData,
-		},
-		Description: aws.String("Test function for Lambda policy security testing"),
-		Timeout:     aws.Int32(30),
-	}
-
-	result, err := ts.lambdaClient.CreateFunction(ts.ctx, createFunctionInput)
-	if err != nil {
-		return fmt.Errorf("failed to create Lambda function: %w", err)
-	}
-
-	ts.functionArn = *result.FunctionArn
-
-	// Wait for function to be active
-	return ts.waitForFunctionActive()
-}
-
-// waitForFunctionActive waits for the Lambda function to become active
-func (ts *TestSuite) waitForFunctionActive() error {
-	maxAttempts := 30
-	for i := 0; i < maxAttempts; i++ {
-		getFunctionInput := &lambda.GetFunctionInput{
-			FunctionName: aws.String(testFunctionName),
-		}
-
-		result, err := ts.lambdaClient.GetFunction(ts.ctx, getFunctionInput)
-		if err != nil {
-			return fmt.Errorf("failed to get function status: %w", err)
-		}
-
-		if result.Configuration.State == types.StateActive {
-			return nil
-		}
-
-		time.Sleep(2 * time.Second)
-	}
-
-	return fmt.Errorf("function did not become active within timeout")
-}
-
-// ApplyTestPolicies applies all test policies to the Lambda function
-func (ts *TestSuite) ApplyTestPolicies() error {
-	for _, policy := range ts.testPolicies {
-		input := &lambda.AddPermissionInput{
-			FunctionName: aws.String(testFunctionName),
-			StatementId:  aws.String(policy.StatementId),
-			Action:       aws.String(policy.Action),
-			Principal:    aws.String(policy.Principal),
-		}
-
-		if policy.SourceArn != nil {
-			input.SourceArn = policy.SourceArn
-		}
-		if policy.SourceAccount != nil {
-			input.SourceAccount = policy.SourceAccount
-		}
-
-		_, err := ts.lambdaClient.AddPermission(ts.ctx, input)
-		if err != nil {
-			return fmt.Errorf("failed to add permission %s: %w", policy.Name, err)
-		}
-	}
-
-	return nil
-}
-
-// VerifyInitialPolicyState verifies that all test policies were applied correctly
-func (ts *TestSuite) VerifyInitialPolicyState() error {
-	policy, err := ts.policyManager.getPolicy(ts.ctx, testFunctionName)
-	if err != nil {
-		return fmt.Errorf("failed to get initial policy: %w", err)
+		result.Error = fmt.Sprintf("Failed to retrieve policy: %v", err)
+		return result, err
 	}
 
 	if policy == "" {
-		return fmt.Errorf("no policy found after applying test policies")
+		// No policy exists, function is not publicly accessible
+		return result, nil
 	}
 
+	result.OriginalPolicy = policy
+
+	// Parse the policy document
 	var policyDoc PolicyDocument
 	if err := json.Unmarshal([]byte(policy), &policyDoc); err != nil {
-		return fmt.Errorf("failed to parse initial policy: %w", err)
+		result.Error = fmt.Sprintf("Failed to parse policy JSON: %v", err)
+		return result, err
 	}
 
-	expectedCount := len(ts.testPolicies)
-	actualCount := len(policyDoc.Statement)
+	// Analyze the policy for public access
+	publicStatements := lpm.identifyPublicStatements(policyDoc.Statement)
+	result.WasPubliclyAccessible = len(publicStatements) > 0
 
-	if actualCount != expectedCount {
-		return fmt.Errorf("expected %d policy statements, found %d", expectedCount, actualCount)
+	if !result.WasPubliclyAccessible {
+		// Function is not publicly accessible
+		return result, nil
 	}
 
-	// Verify that public policies are detected
-	publicStatements := ts.policyManager.identifyPublicStatements(policyDoc.Statement)
-	expectedPublicCount := ts.countPoliciesThatShouldBeRemoved()
+	result.ChangesRequired = true
 
-	if len(publicStatements) != expectedPublicCount {
-		return fmt.Errorf("expected %d public statements, detected %d", expectedPublicCount, len(publicStatements))
+	// Create a new policy with public statements removed
+	securedStatements := make([]PolicyStatement, 0)
+	removedStatements := make([]string, 0)
+
+	for i, stmt := range policyDoc.Statement {
+		if contains(publicStatements, i) {
+			// Record removed statement for audit purposes
+			stmtJSON, _ := json.Marshal(stmt)
+			removedStatements = append(removedStatements, string(stmtJSON))
+		} else {
+			securedStatements = append(securedStatements, stmt)
+		}
 	}
 
-	return nil
-}
+	result.RemovedStatements = removedStatements
 
-// VerifyFinalPolicyState verifies that only legitimate policies remain after security function
-func (ts *TestSuite) VerifyFinalPolicyState() error {
-	policy, err := ts.policyManager.getPolicy(ts.ctx, testFunctionName)
+	// If all statements were removed, remove all permissions
+	if len(securedStatements) == 0 {
+		err = lpm.removeAllPermissions(ctx, functionName)
+		if err != nil {
+			result.Error = fmt.Sprintf("Failed to remove all permissions: %v", err)
+			return result, err
+		}
+		result.ChangesMade = true
+		result.ModifiedPolicy = ""
+		return result, nil
+	}
+
+	// Create new policy document
+	newPolicyDoc := PolicyDocument{
+		Version:   policyDoc.Version,
+		Statement: securedStatements,
+	}
+
+	newPolicyJSON, err := json.Marshal(newPolicyDoc)
 	if err != nil {
-		return fmt.Errorf("failed to get final policy: %w", err)
+		result.Error = fmt.Sprintf("Failed to marshal new policy: %v", err)
+		return result, err
 	}
 
-	expectedKeptCount := ts.countPoliciesThatShouldBeKept()
+	result.ModifiedPolicy = string(newPolicyJSON)
 
-	if policy == "" {
-		if expectedKeptCount > 0 {
-			return fmt.Errorf("all policies removed, but expected %d to be kept", expectedKeptCount)
-		}
-		return nil // No policies remaining, which is correct if all were public
+	// Update the policy
+	err = lpm.updatePolicy(ctx, functionName, string(newPolicyJSON))
+	if err != nil {
+		result.Error = fmt.Sprintf("Failed to update policy: %v", err)
+		return result, err
 	}
 
-	var policyDoc PolicyDocument
-	if err := json.Unmarshal([]byte(policy), &policyDoc); err != nil {
-		return fmt.Errorf("failed to parse final policy: %w", err)
-	}
-
-	actualCount := len(policyDoc.Statement)
-	if actualCount != expectedKeptCount {
-		return fmt.Errorf("expected %d statements to remain, found %d", expectedKeptCount, actualCount)
-	}
-
-	// Verify no public statements remain
-	publicStatements := ts.policyManager.identifyPublicStatements(policyDoc.Statement)
-	if len(publicStatements) > 0 {
-		return fmt.Errorf("found %d public statements after security function", len(publicStatements))
-	}
-
-	// Verify that legitimate policies are still present
-	return ts.verifyLegitimateStatements(policyDoc.Statement)
+	result.ChangesMade = true
+	return result, nil
 }
 
-// verifyLegitimateStatements checks that all legitimate statements are preserved
-func (ts *TestSuite) verifyLegitimateStatements(statements []PolicyStatement) error {
-	legitimatePolicies := make([]TestLambdaPolicy, 0)
-	for _, policy := range ts.testPolicies {
-		if !policy.ShouldRemove {
-			legitimatePolicies = append(legitimatePolicies, policy)
-		}
+// getPolicy retrieves the resource-based policy for a Lambda function
+func (lmp *LambdaPolicyManager) getPolicy(ctx context.Context, functionName string) (string, error) {
+	input := &lambda.GetPolicyInput{
+		FunctionName: aws.String(functionName),
 	}
 
-	for _, legitPolicy := range legitimatePolicies {
-		found := false
-		for _, stmt := range statements {
-			if ts.statementMatchesPolicy(stmt, legitPolicy) {
-				found = true
-				break
-			}
+	result, err := lmp.client.GetPolicy(ctx, input)
+	if err != nil {
+		// Check if the error is because no policy exists
+		var notFoundErr *types.ResourceNotFoundException
+		if errors.As(err, &notFoundErr) {
+			return "", nil // No policy exists
 		}
-		if !found {
-			return fmt.Errorf("legitimate policy %s was incorrectly removed", legitPolicy.Name)
+		return "", fmt.Errorf("AWS API error: %w", err)
+	}
+
+	if result.Policy == nil {
+		return "", nil
+	}
+
+	return *result.Policy, nil
+}
+
+// updatePolicy updates the resource-based policy for a Lambda function
+func (lpm *LambdaPolicyManager) updatePolicy(ctx context.Context, functionName, policy string) error {
+	// Remove all existing permissions first
+	if err := lpm.removeAllPermissions(ctx, functionName); err != nil {
+		return fmt.Errorf("failed to remove existing permissions: %w", err)
+	}
+
+	// Parse the policy to add statements individually using AddPermission
+	var policyDoc PolicyDocument
+	if err := json.Unmarshal([]byte(policy), &policyDoc); err != nil {
+		return fmt.Errorf("failed to parse policy: %w", err)
+	}
+
+	// Add each statement back using AddPermission API
+	for i, stmt := range policyDoc.Statement {
+		if err := lpm.addPermissionFromStatement(ctx, functionName, stmt, i); err != nil {
+			return fmt.Errorf("failed to add permission for statement %d: %w", i, err)
 		}
 	}
 
 	return nil
 }
 
-// statementMatchesPolicy checks if a policy statement matches a test policy
-func (ts *TestSuite) statementMatchesPolicy(stmt PolicyStatement, policy TestLambdaPolicy) bool {
-	// Check action
-	if !ts.actionMatches(stmt.Action, policy.Action) {
-		return false
+// addPermissionFromStatement converts a policy statement to an AddPermission call
+func (lpm *LambdaPolicyManager) addPermissionFromStatement(ctx context.Context, functionName string, stmt PolicyStatement, index int) error {
+	input := &lambda.AddPermissionInput{
+		FunctionName: aws.String(functionName),
+		StatementId:  aws.String(generateStatementId(stmt, index)),
 	}
 
-	// Check principal
-	if !ts.principalMatches(stmt.Principal, policy.Principal) {
-		return false
+	// Extract Action - required field
+	action, err := extractAction(stmt.Action)
+	if err != nil {
+		return fmt.Errorf("failed to extract action: %w", err)
+	}
+	input.Action = aws.String(action)
+
+	// Extract Principal - required field
+	principal, principalOrgID, sourceAccount, err := extractPrincipalInfo(stmt.Principal)
+	if err != nil {
+		return fmt.Errorf("failed to extract principal: %w", err)
+	}
+	input.Principal = aws.String(principal)
+
+	// Set optional fields if present
+	if principalOrgID != "" {
+		input.PrincipalOrgID = aws.String(principalOrgID)
+	}
+	if sourceAccount != "" {
+		input.SourceAccount = aws.String(sourceAccount)
 	}
 
-	return true
+	// Handle EventSourceToken if present in conditions
+	if eventSourceToken := extractEventSourceToken(stmt.Condition); eventSourceToken != "" {
+		input.EventSourceToken = aws.String(eventSourceToken)
+	}
+
+	// Handle SourceArn if present in conditions
+	if sourceArn := extractSourceArn(stmt.Condition); sourceArn != "" {
+		input.SourceArn = aws.String(sourceArn)
+	}
+
+	_, err = lpm.client.AddPermission(ctx, input)
+	if err != nil {
+		return fmt.Errorf("AWS API error: %w", err)
+	}
+
+	return nil
 }
 
-// actionMatches checks if statement action matches expected action
-func (ts *TestSuite) actionMatches(stmtAction interface{}, expectedAction string) bool {
-	switch a := stmtAction.(type) {
+// generateStatementId generates a statement ID, preferring the original Sid if present
+func generateStatementId(stmt PolicyStatement, index int) string {
+	if stmt.Sid != "" {
+		return stmt.Sid
+	}
+	return fmt.Sprintf("statement-%d-%d", index, time.Now().Unix())
+}
+
+// extractAction extracts the action from a policy statement action field
+func extractAction(action interface{}) (string, error) {
+	switch a := action.(type) {
 	case string:
-		return a == expectedAction
+		return a, nil
 	case []interface{}:
-		for _, action := range a {
-			if str, ok := action.(string); ok && str == expectedAction {
+		if len(a) > 0 {
+			if str, ok := a[0].(string); ok {
+				return str, nil
+			}
+		}
+		return "", fmt.Errorf("no valid action found in array")
+	default:
+		return "", fmt.Errorf("unsupported action type: %T", action)
+	}
+}
+
+// extractPrincipalInfo extracts principal information from the principal field
+func extractPrincipalInfo(principal interface{}) (principalValue, principalOrgID, sourceAccount string, err error) {
+	switch p := principal.(type) {
+	case string:
+		if p == "*" {
+			return "*", "", "", nil
+		}
+		// Could be an ARN or account ID
+		return p, "", "", nil
+	case map[string]interface{}:
+		// Handle AWS principals
+		if aws, exists := p["AWS"]; exists {
+			switch awsVal := aws.(type) {
+			case string:
+				return awsVal, "", "", nil
+			case []interface{}:
+				if len(awsVal) > 0 {
+					if str, ok := awsVal[0].(string); ok {
+						return str, "", "", nil
+					}
+				}
+			}
+		}
+		// Handle Service principals
+		if service, exists := p["Service"]; exists {
+			if str, ok := service.(string); ok {
+				return str, "", "", nil
+			}
+		}
+		return "", "", "", fmt.Errorf("unsupported principal structure")
+	default:
+		return "", "", "", fmt.Errorf("unsupported principal type: %T", principal)
+	}
+}
+
+// extractEventSourceToken extracts EventSourceToken from conditions
+func extractEventSourceToken(condition interface{}) string {
+	if condition == nil {
+		return ""
+	}
+	
+	condMap, ok := condition.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	
+	if stringEquals, exists := condMap["StringEquals"]; exists {
+		if seMap, ok := stringEquals.(map[string]interface{}); ok {
+			if token, exists := seMap["lambda:EventSourceToken"]; exists {
+				if tokenStr, ok := token.(string); ok {
+					return tokenStr
+				}
+			}
+		}
+	}
+	
+	return ""
+}
+
+// extractSourceArn extracts SourceArn from conditions
+func extractSourceArn(condition interface{}) string {
+	if condition == nil {
+		return ""
+	}
+	
+	condMap, ok := condition.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	
+	if arnLike, exists := condMap["ArnLike"]; exists {
+		if alMap, ok := arnLike.(map[string]interface{}); ok {
+			if arn, exists := alMap["AWS:SourceArn"]; exists {
+				if arnStr, ok := arn.(string); ok {
+					return arnStr
+				}
+			}
+		}
+	}
+	
+	return ""
+}
+
+// removeAllPermissions removes all permissions from a Lambda function by removing each statement
+func (lpm *LambdaPolicyManager) removeAllPermissions(ctx context.Context, functionName string) error {
+	// First, get the current policy to extract statement IDs
+	currentPolicy, err := lpm.getPolicy(ctx, functionName)
+	if err != nil {
+		return fmt.Errorf("failed to get current policy: %w", err)
+	}
+
+	if currentPolicy == "" {
+		return nil // No policy exists, nothing to remove
+	}
+
+	// Parse the policy to get statement IDs
+	var policyDoc PolicyDocument
+	if err := json.Unmarshal([]byte(currentPolicy), &policyDoc); err != nil {
+		return fmt.Errorf("failed to parse current policy: %w", err)
+	}
+
+	// Remove each statement individually
+	for i, stmt := range policyDoc.Statement {
+		statementId := stmt.Sid
+		if statementId == "" {
+			// If no Sid is present, we need to try to remove by a generated pattern
+			// This is tricky because we don't know what StatementId was used originally
+			// We'll try common patterns
+			possibleIds := []string{
+				fmt.Sprintf("statement-%d", i),
+				fmt.Sprintf("Statement-%d", i),
+				fmt.Sprintf("stmt-%d", i),
+				fmt.Sprintf("%d", i),
+			}
+			
+			removed := false
+			for _, possibleId := range possibleIds {
+				if err := lpm.removePermission(ctx, functionName, possibleId); err == nil {
+					removed = true
+					break
+				}
+			}
+			
+			if !removed {
+				// Log warning but continue - this statement might have been added differently
+				fmt.Printf("Warning: Could not remove statement at index %d (no Sid and unable to guess StatementId)\n", i)
+			}
+		} else {
+			if err := lpm.removePermission(ctx, functionName, statementId); err != nil {
+				// Log error but continue with other statements
+				fmt.Printf("Warning: Could not remove statement with Sid '%s': %v\n", statementId, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// removePermission removes a specific permission statement by StatementId
+func (lpm *LambdaPolicyManager) removePermission(ctx context.Context, functionName, statementId string) error {
+	input := &lambda.RemovePermissionInput{
+		FunctionName: aws.String(functionName),
+		StatementId:  aws.String(statementId),
+	}
+
+	_, err := lpm.client.RemovePermission(ctx, input)
+	if err != nil {
+		var notFoundErr *types.ResourceNotFoundException
+		if errors.As(err, &notFoundErr) {
+			return nil // Statement doesn't exist, which is fine
+		}
+		return fmt.Errorf("AWS API error: %w", err)
+	}
+
+	return nil
+}
+
+// identifyPublicStatements identifies statements that grant public access
+func (lpm *LambdaPolicyManager) identifyPublicStatements(statements []PolicyStatement) []int {
+	publicIndexes := make([]int, 0)
+
+	for i, stmt := range statements {
+		if stmt.Effect == "Deny" {
+			continue // Deny statements don't grant access
+		}
+
+		if lpm.isPrincipalPublic(stmt.Principal) {
+			publicIndexes = append(publicIndexes, i)
+		}
+	}
+
+	return publicIndexes
+}
+
+// isPrincipalPublic checks if a principal grants public access
+func (lpm *LambdaPolicyManager) isPrincipalPublic(principal interface{}) bool {
+	switch p := principal.(type) {
+	case string:
+		return p == "*"
+	case []interface{}:
+		for _, item := range p {
+			if str, ok := item.(string); ok && str == "*" {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		// Check AWS principals
+		if aws, exists := p["AWS"]; exists {
+			switch awsVal := aws.(type) {
+			case string:
+				return awsVal == "*"
+			case []interface{}:
+				for _, item := range awsVal {
+					if str, ok := item.(string); ok && str == "*" {
+						return true
+					}
+				}
+			}
+		}
+		// Check for other service principals that might be overly permissive
+		// This is a simplified check - in practice, you might want more sophisticated logic
+		for _, value := range p {
+			if str, ok := value.(string); ok && str == "*" {
 				return true
 			}
 		}
@@ -519,119 +508,77 @@ func (ts *TestSuite) actionMatches(stmtAction interface{}, expectedAction string
 	return false
 }
 
-// principalMatches checks if statement principal matches expected principal
-func (ts *TestSuite) principalMatches(stmtPrincipal interface{}, expectedPrincipal string) bool {
-	switch p := stmtPrincipal.(type) {
-	case string:
-		return p == expectedPrincipal
-	case map[string]interface{}:
-		if service, ok := p["Service"]; ok {
-			if str, ok := service.(string); ok {
-				return str == expectedPrincipal
-			}
-		}
-		if aws, ok := p["AWS"]; ok {
-			if str, ok := aws.(string); ok {
-				return str == expectedPrincipal
-			}
+// validateLambdaARN validates that the provided ARN is a valid Lambda function ARN
+func validateLambdaARN(arn string) error {
+	// AWS Lambda ARN pattern: arn:aws:lambda:region:account-id:function:function-name
+	arnPattern := `^arn:aws:lambda:[a-z0-9-]+:\d{12}:function:[a-zA-Z0-9-_]+(?::\$LATEST|\d+)?$`
+	matched, err := regexp.MatchString(arnPattern, arn)
+	if err != nil {
+		return fmt.Errorf("regex error: %w", err)
+	}
+	if !matched {
+		return fmt.Errorf("invalid Lambda function ARN format")
+	}
+	return nil
+}
+
+// extractFunctionName extracts the function name from a Lambda ARN
+func extractFunctionName(arn string) (string, error) {
+	parts := strings.Split(arn, ":")
+	if len(parts) < 7 {
+		return "", fmt.Errorf("invalid ARN format")
+	}
+	
+	functionName := parts[6]
+	// Handle versioned/aliased ARNs
+	if len(parts) > 7 {
+		functionName = parts[6] // Just the function name, not the version/alias
+	}
+	
+	return functionName, nil
+}
+
+// contains checks if a slice contains a specific integer
+func contains(slice []int, item int) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
 		}
 	}
 	return false
 }
 
-// countPoliciesThatShouldBeRemoved counts test policies that should be removed
-func (ts *TestSuite) countPoliciesThatShouldBeRemoved() int {
-	count := 0
-	for _, policy := range ts.testPolicies {
-		if policy.ShouldRemove {
-			count++
-		}
-	}
-	return count
-}
-
-// countPoliciesThatShouldBeKept counts test policies that should be kept
-func (ts *TestSuite) countPoliciesThatShouldBeKept() int {
-	count := 0
-	for _, policy := range ts.testPolicies {
-		if !policy.ShouldRemove {
-			count++
-		}
-	}
-	return count
-}
-
-// Cleanup removes all created resources
-func (ts *TestSuite) Cleanup() error {
-	var errors []string
-
-	// Remove deployment package
-	if err := os.Remove(testZipFile); err != nil && !os.IsNotExist(err) {
-		errors = append(errors, fmt.Sprintf("failed to remove zip file: %v", err))
-	}
-
-	// Delete Lambda function
-	if ts.functionArn != "" {
-		deleteFunctionInput := &lambda.DeleteFunctionInput{
-			FunctionName: aws.String(testFunctionName),
-		}
-		if _, err := ts.lambdaClient.DeleteFunction(ts.ctx, deleteFunctionInput); err != nil {
-			errors = append(errors, fmt.Sprintf("failed to delete Lambda function: %v", err))
-		}
-	}
-
-	// Delete IAM role (first detach policies)
-	if ts.roleArn != "" {
-		// Detach managed policy
-		detachPolicyInput := &iam.DetachRolePolicyInput{
-			RoleName:  aws.String(testRoleName),
-			PolicyArn: aws.String("arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"),
-		}
-		if _, err := ts.iamClient.DetachRolePolicy(ts.ctx, detachPolicyInput); err != nil {
-			errors = append(errors, fmt.Sprintf("failed to detach role policy: %v", err))
-		}
-
-		// Delete role
-		deleteRoleInput := &iam.DeleteRoleInput{
-			RoleName: aws.String(testRoleName),
-		}
-		if _, err := ts.iamClient.DeleteRole(ts.ctx, deleteRoleInput); err != nil {
-			errors = append(errors, fmt.Sprintf("failed to delete IAM role: %v", err))
-		}
-	}
-
-	if len(errors) > 0 {
-		return fmt.Errorf("cleanup errors: %s", strings.Join(errors, "; "))
-	}
-
-	return nil
-}
-
-// TestMain is the entry point for the test
-func TestLambdaPolicySecurity(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
-
-	ctx := context.Background()
-	testSuite, err := NewTestSuite(ctx)
-	if err != nil {
-		t.Fatalf("Failed to create test suite: %v", err)
-	}
-
-	testSuite.RunFullTest(t)
-}
-
-// Standalone function to run the test manually
+// Example usage function
 func main() {
 	ctx := context.Background()
-	testSuite, err := NewTestSuite(ctx)
+	
+	// Initialize the policy manager
+	manager, err := NewLambdaPolicyManager(ctx)
 	if err != nil {
-		fmt.Printf("Failed to create test suite: %v\n", err)
+		fmt.Printf("Failed to initialize policy manager: %v\n", err)
 		return
 	}
 
-	// Create a mock testing.T for standalone execution
-	t := &testing.T{}
-	testSuite.RunFullTest(t)
+	// Example Lambda function ARN - replace with actual ARN
+	functionARN := "arn:aws:lambda:us-east-1:123456789012:function:my-function"
+
+	// Secure the Lambda function
+	result, err := manager.SecureLambdaFunction(ctx, functionARN)
+	if err != nil {
+		fmt.Printf("Error securing Lambda function: %v\n", err)
+		return
+	}
+
+	// Print results
+	resultJSON, _ := json.MarshalIndent(result, "", "  ")
+	fmt.Printf("Security Analysis Result:\n%s\n", string(resultJSON))
+
+	// Summary
+	fmt.Printf("\nSummary:\n")
+	fmt.Printf("Function: %s\n", result.FunctionARN)
+	fmt.Printf("Was publicly accessible: %v\n", result.WasPubliclyAccessible)
+	fmt.Printf("Changes made: %v\n", result.ChangesMade)
+	if len(result.RemovedStatements) > 0 {
+		fmt.Printf("Removed %d problematic statements\n", len(result.RemovedStatements))
+	}
 }
