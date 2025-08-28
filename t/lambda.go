@@ -129,11 +129,11 @@ func (lpm *LambdaPolicyManager) SecureLambdaFunction(ctx context.Context, functi
 
 	result.RemovedStatements = removedStatements
 
-	// If all statements were removed, remove the entire policy
+	// If all statements were removed, remove all permissions
 	if len(securedStatements) == 0 {
-		err = lpm.removePolicy(ctx, functionName)
+		err = lpm.removeAllPermissions(ctx, functionName)
 		if err != nil {
-			result.Error = fmt.Sprintf("Failed to remove policy: %v", err)
+			result.Error = fmt.Sprintf("Failed to remove all permissions: %v", err)
 			return result, err
 		}
 		result.ChangesMade = true
@@ -191,9 +191,9 @@ func (lmp *LambdaPolicyManager) getPolicy(ctx context.Context, functionName stri
 
 // updatePolicy updates the resource-based policy for a Lambda function
 func (lpm *LambdaPolicyManager) updatePolicy(ctx context.Context, functionName, policy string) error {
-	// Remove the existing policy first
-	if err := lpm.removePolicy(ctx, functionName); err != nil {
-		return fmt.Errorf("failed to remove existing policy: %w", err)
+	// Remove all existing permissions first
+	if err := lpm.removeAllPermissions(ctx, functionName); err != nil {
+		return fmt.Errorf("failed to remove existing permissions: %w", err)
 	}
 
 	// Parse the policy to add statements individually using AddPermission
@@ -367,17 +367,73 @@ func extractSourceArn(condition interface{}) string {
 	return ""
 }
 
-// removePolicy removes the resource-based policy from a Lambda function
-func (lpm *LambdaPolicyManager) removePolicy(ctx context.Context, functionName string) error {
-	input := &lambda.RemovePolicyInput{
-		FunctionName: aws.String(functionName),
+// removeAllPermissions removes all permissions from a Lambda function by removing each statement
+func (lpm *LambdaPolicyManager) removeAllPermissions(ctx context.Context, functionName string) error {
+	// First, get the current policy to extract statement IDs
+	currentPolicy, err := lpm.getPolicy(ctx, functionName)
+	if err != nil {
+		return fmt.Errorf("failed to get current policy: %w", err)
 	}
 
-	_, err := lpm.client.RemovePolicy(ctx, input)
+	if currentPolicy == "" {
+		return nil // No policy exists, nothing to remove
+	}
+
+	// Parse the policy to get statement IDs
+	var policyDoc PolicyDocument
+	if err := json.Unmarshal([]byte(currentPolicy), &policyDoc); err != nil {
+		return fmt.Errorf("failed to parse current policy: %w", err)
+	}
+
+	// Remove each statement individually
+	for i, stmt := range policyDoc.Statement {
+		statementId := stmt.Sid
+		if statementId == "" {
+			// If no Sid is present, we need to try to remove by a generated pattern
+			// This is tricky because we don't know what StatementId was used originally
+			// We'll try common patterns
+			possibleIds := []string{
+				fmt.Sprintf("statement-%d", i),
+				fmt.Sprintf("Statement-%d", i),
+				fmt.Sprintf("stmt-%d", i),
+				fmt.Sprintf("%d", i),
+			}
+			
+			removed := false
+			for _, possibleId := range possibleIds {
+				if err := lpm.removePermission(ctx, functionName, possibleId); err == nil {
+					removed = true
+					break
+				}
+			}
+			
+			if !removed {
+				// Log warning but continue - this statement might have been added differently
+				fmt.Printf("Warning: Could not remove statement at index %d (no Sid and unable to guess StatementId)\n", i)
+			}
+		} else {
+			if err := lpm.removePermission(ctx, functionName, statementId); err != nil {
+				// Log error but continue with other statements
+				fmt.Printf("Warning: Could not remove statement with Sid '%s': %v\n", statementId, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// removePermission removes a specific permission statement by StatementId
+func (lpm *LambdaPolicyManager) removePermission(ctx context.Context, functionName, statementId string) error {
+	input := &lambda.RemovePermissionInput{
+		FunctionName: aws.String(functionName),
+		StatementId:  aws.String(statementId),
+	}
+
+	_, err := lpm.client.RemovePermission(ctx, input)
 	if err != nil {
 		var notFoundErr *types.ResourceNotFoundException
 		if errors.As(err, &notFoundErr) {
-			return nil // Policy doesn't exist, which is fine
+			return nil // Statement doesn't exist, which is fine
 		}
 		return fmt.Errorf("AWS API error: %w", err)
 	}
