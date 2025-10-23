@@ -61,8 +61,24 @@ def lambda_handler(event, context):
         result['service_catalog']['provisioned_products'] = provisioned_products
         result['service_catalog']['provisioned_count'] = len(provisioned_products)
         
-        # Step 4: Check Amplify applications
-        amplify_status = check_amplify_apps(account_b_session, region)
+        # Step 4: Get AmplifyAppId from provisioned product outputs and check status
+        amplify_app_ids = []
+        for product in provisioned_products:
+            outputs = get_provisioned_product_outputs(sc_client, product['id'])
+            product['outputs'] = outputs
+            
+            # Extract AmplifyAppId from outputs
+            amplify_app_id = None
+            for output in outputs:
+                if output.get('key') == 'AmplifyAppId':
+                    amplify_app_id = output.get('value')
+                    amplify_app_ids.append(amplify_app_id)
+                    break
+            
+            product['amplify_app_id'] = amplify_app_id
+        
+        # Check Amplify applications using the extracted IDs
+        amplify_status = check_amplify_apps_by_id(account_b_session, region, amplify_app_ids)
         result['amplify'] = amplify_status
         
         # Step 5: Query DynamoDB for EC2 instances
@@ -209,6 +225,142 @@ def get_provisioned_products(sc_client, product_id):
         return provisioned
     except ClientError as e:
         raise Exception(f"Error listing provisioned products: {str(e)}")
+
+
+def get_provisioned_product_outputs(sc_client, provisioned_product_id):
+    """Get outputs from a provisioned product."""
+    outputs = []
+    
+    try:
+        # Get the provisioned product details
+        response = sc_client.describe_provisioned_product(
+            Id=provisioned_product_id
+        )
+        
+        provisioned_product = response.get('ProvisionedProductDetail', {})
+        
+        # Get the last successful record to retrieve outputs
+        if provisioned_product.get('LastSuccessfulProvisioningRecordId'):
+            record_response = sc_client.describe_record(
+                Id=provisioned_product['LastSuccessfulProvisioningRecordId']
+            )
+            
+            record_outputs = record_response.get('RecordOutputs', [])
+            
+            for output in record_outputs:
+                outputs.append({
+                    'key': output.get('OutputKey'),
+                    'value': output.get('OutputValue'),
+                    'description': output.get('Description')
+                })
+        
+        return outputs
+    except ClientError as e:
+        return [{
+            'error': str(e),
+            'provisioned_product_id': provisioned_product_id
+        }]
+
+
+def check_amplify_apps_by_id(session, region, app_ids):
+    """Check status of specific Amplify applications by their IDs."""
+    amplify_client = session.client('amplify', region_name=region)
+    
+    apps = []
+    errors = []
+    
+    for app_id in app_ids:
+        if not app_id:
+            continue
+        
+        try:
+            response = amplify_client.get_app(appId=app_id)
+            app = response.get('app', {})
+            
+            # Get branches for this app
+            branches = []
+            try:
+                branches_response = amplify_client.list_branches(
+                    appId=app_id,
+                    maxResults=50
+                )
+                
+                for branch in branches_response.get('branches', []):
+                    branches.append({
+                        'branch_name': branch.get('branchName'),
+                        'stage': branch.get('stage'),
+                        'display_name': branch.get('displayName'),
+                        'enable_auto_build': branch.get('enableAutoBuild'),
+                        'total_number_of_jobs': branch.get('totalNumberOfJobs'),
+                        'active_job_id': branch.get('activeJobId')
+                    })
+            except ClientError as branch_error:
+                errors.append(f"Error listing branches for app {app_id}: {str(branch_error)}")
+            
+            # Get latest deployment info
+            backend_environments = []
+            try:
+                backend_response = amplify_client.list_backend_environments(
+                    appId=app_id,
+                    maxResults=50
+                )
+                
+                for backend in backend_response.get('backendEnvironments', []):
+                    backend_environments.append({
+                        'environment_name': backend.get('environmentName'),
+                        'stack_name': backend.get('stackName'),
+                        'deployment_artifacts': backend.get('deploymentArtifacts'),
+                        'create_time': backend.get('createTime').isoformat() if backend.get('createTime') else None
+                    })
+            except ClientError as backend_error:
+                errors.append(f"Error listing backend environments for app {app_id}: {str(backend_error)}")
+            
+            apps.append({
+                'app_id': app_id,
+                'name': app.get('name'),
+                'description': app.get('description'),
+                'repository': app.get('repository'),
+                'platform': app.get('platform'),
+                'default_domain': app.get('defaultDomain'),
+                'enable_branch_auto_build': app.get('enableBranchAutoBuild'),
+                'enable_branch_auto_deletion': app.get('enableBranchAutoDeletion'),
+                'enable_basic_auth': app.get('enableBasicAuth'),
+                'production_branch': {
+                    'branch_name': app.get('productionBranch', {}).get('branchName'),
+                    'last_deploy_time': app.get('productionBranch', {}).get('lastDeployTime').isoformat() 
+                        if app.get('productionBranch', {}).get('lastDeployTime') else None,
+                    'status': app.get('productionBranch', {}).get('status'),
+                    'thumbnail_url': app.get('productionBranch', {}).get('thumbnailUrl')
+                } if app.get('productionBranch') else None,
+                'create_time': app.get('createTime').isoformat() if app.get('createTime') else None,
+                'update_time': app.get('updateTime').isoformat() if app.get('updateTime') else None,
+                'custom_rules': app.get('customRules', []),
+                'branches': branches,
+                'backend_environments': backend_environments,
+                'status': 'ACTIVE' if app.get('productionBranch') else 'NO_PRODUCTION_BRANCH'
+            })
+            
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'NotFoundException':
+                apps.append({
+                    'app_id': app_id,
+                    'status': 'NOT_FOUND',
+                    'error': f"Amplify app {app_id} not found"
+                })
+            else:
+                errors.append(f"Error getting app {app_id}: {str(e)}")
+                apps.append({
+                    'app_id': app_id,
+                    'status': 'ERROR',
+                    'error': str(e)
+                })
+    
+    return {
+        'total_apps': len(apps),
+        'apps': apps,
+        'errors': errors if errors else []
+    }
 
 
 def check_amplify_apps(session, region):
