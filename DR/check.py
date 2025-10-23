@@ -727,6 +727,74 @@ def check_terraform_workspaces(token, ec2_records):
             'workspaces': []
         }
 
+from typing import Dict, Any, List, Optional
+from botocore.exceptions import ClientError
+
+
+def describe_provisioned_product_with_outputs(
+    sc_client,
+    provisioned_product_id: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Describe a provisioned AWS Service Catalog product, including:
+      - Core metadata (name, status, IDs, etc.)
+      - Outputs from the last successful provisioning record
+
+    Args:
+        sc_client: boto3 Service Catalog client.
+        provisioned_product_id (str): The ID of the provisioned product.
+
+    Returns:
+        Optional[Dict[str, Any]]: Product details and outputs, or None on failure.
+    """
+    try:
+        # 1️⃣ Describe the provisioned product
+        response = sc_client.describe_provisioned_product(Id=provisioned_product_id)
+        product_detail = response.get("ProvisionedProductDetail", {})
+
+        status = product_detail.get("Status")
+        status_message = product_detail.get("StatusMessage", "")
+        outputs: List[Dict[str, str]] = []
+
+        # 2️⃣ Retrieve outputs from the last successful record (if any)
+        last_record_id = product_detail.get("LastSuccessfulProvisioningRecordId")
+        if last_record_id:
+            try:
+                record_response = sc_client.describe_record(Id=last_record_id)
+                for output in record_response.get("RecordOutputs", []):
+                    outputs.append({
+                        "Key": output.get("OutputKey"),
+                        "Value": output.get("OutputValue"),
+                        "Description": output.get("Description"),
+                    })
+            except ClientError as e:
+                outputs.append({
+                    "Error": f"Failed to retrieve record outputs: {e}",
+                    "ProvisionedProductId": provisioned_product_id
+                })
+        else:
+            outputs.append({
+                "Warning": "No successful provisioning record found.",
+                "ProvisionedProductId": provisioned_product_id
+            })
+
+        # 3️⃣ Return structured information
+        return {
+            "Name": product_detail.get("Name"),
+            "Id": product_detail.get("Id"),
+            "Arn": product_detail.get("Arn"),
+            "Status": status,
+            "StatusMessage": status_message,
+            "ProductId": product_detail.get("ProductId"),
+            "ProvisioningArtifactId": product_detail.get("ProvisioningArtifactId"),
+            "CreatedTime": product_detail.get("CreatedTime"),
+            "Outputs": outputs,
+        }
+
+    except ClientError as e:
+        print(f"Error describing provisioned product {provisioned_product_id}: {e}")
+        return None
+
 
 def format_response(body, status_code=200):
     """Format Lambda response."""
