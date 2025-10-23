@@ -56,29 +56,36 @@ def lambda_handler(event, context):
         result['service_catalog']['product_id'] = product_id
         result['service_catalog']['product_name'] = product_name
         
-        # Get provisioned products
-        provisioned_products = get_provisioned_products(sc_client, product_id)
-        result['service_catalog']['provisioned_products'] = provisioned_products
-        result['service_catalog']['provisioned_count'] = len(provisioned_products)
+        # Get provisioned product (expecting only one)
+        provisioned_product = get_provisioned_product(sc_client, product_id)
         
-        # Step 4: Get AmplifyAppId from provisioned product outputs and check status
-        amplify_app_ids = []
-        for product in provisioned_products:
-            outputs = get_provisioned_product_outputs(sc_client, product['id'])
-            product['outputs'] = outputs
-            
-            # Extract AmplifyAppId from outputs
-            amplify_app_id = None
-            for output in outputs:
-                if output.get('key') == 'AmplifyAppId':
-                    amplify_app_id = output.get('value')
-                    amplify_app_ids.append(amplify_app_id)
-                    break
-            
-            product['amplify_app_id'] = amplify_app_id
+        if not provisioned_product:
+            result['errors'].append(f"No provisioned product found for product '{product_name}'")
+            result['status'] = 'FAILED'
+            return format_response(result)
         
-        # Check Amplify applications using the extracted IDs
-        amplify_status = check_amplify_apps_by_id(account_b_session, region, amplify_app_ids)
+        result['service_catalog']['provisioned_product'] = provisioned_product
+        
+        # Step 4: Get AmplifyAppId from provisioned product outputs
+        outputs = get_provisioned_product_outputs(sc_client, provisioned_product['id'])
+        provisioned_product['outputs'] = outputs
+        
+        # Extract AmplifyAppId from outputs
+        amplify_app_id = None
+        for output in outputs:
+            if output.get('key') == 'AmplifyAppId':
+                amplify_app_id = output.get('value')
+                break
+        
+        if not amplify_app_id:
+            result['errors'].append("AmplifyAppId not found in provisioned product outputs")
+            result['status'] = 'FAILED'
+            return format_response(result)
+        
+        provisioned_product['amplify_app_id'] = amplify_app_id
+        
+        # Check Amplify application using the extracted ID
+        amplify_status = check_amplify_app_by_id(account_b_session, region, amplify_app_id)
         result['amplify'] = amplify_status
         
         # Step 5: Query DynamoDB for EC2 instances
@@ -124,7 +131,7 @@ def lambda_handler(event, context):
                 })
         
         # Step 7: Check CloudFormation stacks
-        cfn_status = check_cloudformation_stacks(account_b_session, region, provisioned_products)
+        cfn_status = check_cloudformation_stacks(account_b_session, region, provisioned_product)
         result['cloudformation'] = cfn_status
         
         # Step 8: Check Terraform Cloud (if applicable)
@@ -200,6 +207,31 @@ def get_product_id(sc_client, portfolio_id, product_name):
         raise Exception(f"Error searching products: {str(e)}")
 
 
+def get_provisioned_product(sc_client, product_id):
+    """Get the single provisioned product for a given product ID."""
+    try:
+        paginator = sc_client.get_paginator('scan_provisioned_products')
+        
+        for page in paginator.paginate(
+            AccessLevelFilter={'Key': 'Account', 'Value': 'self'}
+        ):
+            for product in page.get('ProvisionedProducts', []):
+                if product.get('ProductId') == product_id:
+                    return {
+                        'id': product.get('Id'),
+                        'name': product.get('Name'),
+                        'status': product.get('Status'),
+                        'type': product.get('Type'),
+                        'created_time': product.get('CreatedTime').isoformat() if product.get('CreatedTime') else None,
+                        'last_record_id': product.get('LastRecordId'),
+                        'physical_id': product.get('PhysicalId')
+                    }
+        
+        return None
+    except ClientError as e:
+        raise Exception(f"Error getting provisioned product: {str(e)}")
+
+
 def get_provisioned_products(sc_client, product_id):
     """List all provisioned products for a given product ID."""
     provisioned = []
@@ -260,6 +292,95 @@ def get_provisioned_product_outputs(sc_client, provisioned_product_id):
             'error': str(e),
             'provisioned_product_id': provisioned_product_id
         }]
+
+
+def check_amplify_app_by_id(session, region, app_id):
+    """Check status of a specific Amplify application by its ID."""
+    amplify_client = session.client('amplify', region_name=region)
+    
+    try:
+        response = amplify_client.get_app(appId=app_id)
+        app = response.get('app', {})
+        
+        # Get branches for this app
+        branches = []
+        try:
+            branches_response = amplify_client.list_branches(
+                appId=app_id,
+                maxResults=50
+            )
+            
+            for branch in branches_response.get('branches', []):
+                branches.append({
+                    'branch_name': branch.get('branchName'),
+                    'stage': branch.get('stage'),
+                    'display_name': branch.get('displayName'),
+                    'enable_auto_build': branch.get('enableAutoBuild'),
+                    'total_number_of_jobs': branch.get('totalNumberOfJobs'),
+                    'active_job_id': branch.get('activeJobId'),
+                    'update_time': branch.get('updateTime').isoformat() if branch.get('updateTime') else None
+                })
+        except ClientError as branch_error:
+            branches = [{'error': str(branch_error)}]
+        
+        # Get backend environments
+        backend_environments = []
+        try:
+            backend_response = amplify_client.list_backend_environments(
+                appId=app_id,
+                maxResults=50
+            )
+            
+            for backend in backend_response.get('backendEnvironments', []):
+                backend_environments.append({
+                    'environment_name': backend.get('environmentName'),
+                    'stack_name': backend.get('stackName'),
+                    'deployment_artifacts': backend.get('deploymentArtifacts'),
+                    'create_time': backend.get('createTime').isoformat() if backend.get('createTime') else None,
+                    'update_time': backend.get('updateTime').isoformat() if backend.get('updateTime') else None
+                })
+        except ClientError as backend_error:
+            backend_environments = [{'error': str(backend_error)}]
+        
+        return {
+            'app_id': app_id,
+            'name': app.get('name'),
+            'description': app.get('description'),
+            'repository': app.get('repository'),
+            'platform': app.get('platform'),
+            'default_domain': app.get('defaultDomain'),
+            'enable_branch_auto_build': app.get('enableBranchAutoBuild'),
+            'enable_branch_auto_deletion': app.get('enableBranchAutoDeletion'),
+            'enable_basic_auth': app.get('enableBasicAuth'),
+            'production_branch': {
+                'branch_name': app.get('productionBranch', {}).get('branchName'),
+                'last_deploy_time': app.get('productionBranch', {}).get('lastDeployTime').isoformat() 
+                    if app.get('productionBranch', {}).get('lastDeployTime') else None,
+                'status': app.get('productionBranch', {}).get('status'),
+                'thumbnail_url': app.get('productionBranch', {}).get('thumbnailUrl')
+            } if app.get('productionBranch') else None,
+            'create_time': app.get('createTime').isoformat() if app.get('createTime') else None,
+            'update_time': app.get('updateTime').isoformat() if app.get('updateTime') else None,
+            'custom_rules': app.get('customRules', []),
+            'branches': branches,
+            'backend_environments': backend_environments,
+            'status': 'ACTIVE' if app.get('productionBranch') else 'NO_PRODUCTION_BRANCH'
+        }
+        
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        if error_code == 'NotFoundException':
+            return {
+                'app_id': app_id,
+                'status': 'NOT_FOUND',
+                'error': f"Amplify app {app_id} not found"
+            }
+        else:
+            return {
+                'app_id': app_id,
+                'status': 'ERROR',
+                'error': str(e)
+            }
 
 
 def check_amplify_apps_by_id(session, region, app_ids):
@@ -454,7 +575,78 @@ def check_ec2_instance(ec2_client, instance_id):
         raise Exception(f"Error describing instance {instance_id}: {str(e)}")
 
 
-def check_cloudformation_stacks(session, region, provisioned_products):
+def check_cloudformation_stacks(session, region, provisioned_product):
+    """Check CloudFormation stack associated with the provisioned product."""
+    cfn_client = session.client('cloudformation', region_name=region)
+    
+    physical_id = provisioned_product.get('physical_id')
+    
+    if not physical_id or not physical_id.startswith('arn:aws:cloudformation'):
+        return {
+            'status': 'NO_STACK',
+            'message': 'Provisioned product does not have a CloudFormation stack'
+        }
+    
+    # Extract stack name from ARN
+    try:
+        stack_name = physical_id.split('/')[-2]
+        
+        response = cfn_client.describe_stacks(StackName=stack_name)
+        
+        if response.get('Stacks'):
+            stack = response['Stacks'][0]
+            
+            # Get stack outputs
+            outputs = []
+            for output in stack.get('Outputs', []):
+                outputs.append({
+                    'key': output.get('OutputKey'),
+                    'value': output.get('OutputValue'),
+                    'description': output.get('Description')
+                })
+            
+            # Get stack resources
+            resources = []
+            try:
+                resources_response = cfn_client.list_stack_resources(StackName=stack_name)
+                for resource in resources_response.get('StackResourceSummaries', []):
+                    resources.append({
+                        'logical_id': resource.get('LogicalResourceId'),
+                        'physical_id': resource.get('PhysicalResourceId'),
+                        'type': resource.get('ResourceType'),
+                        'status': resource.get('ResourceStatus'),
+                        'timestamp': resource.get('LastUpdatedTimestamp').isoformat() 
+                            if resource.get('LastUpdatedTimestamp') else None
+                    })
+            except ClientError:
+                pass
+            
+            return {
+                'stack_name': stack.get('StackName'),
+                'stack_id': stack.get('StackId'),
+                'status': stack.get('StackStatus'),
+                'creation_time': stack.get('CreationTime').isoformat() if stack.get('CreationTime') else None,
+                'last_updated_time': stack.get('LastUpdatedTime').isoformat() if stack.get('LastUpdatedTime') else None,
+                'outputs': outputs,
+                'resources': resources,
+                'provisioned_product_id': provisioned_product.get('id')
+            }
+            
+    except ClientError as e:
+        return {
+            'stack_name': physical_id,
+            'status': 'ERROR',
+            'error': str(e),
+            'provisioned_product_id': provisioned_product.get('id')
+        }
+    
+    return {
+        'status': 'NOT_FOUND',
+        'provisioned_product_id': provisioned_product.get('id')
+    }
+
+
+def check_cloudformation_stacks_old(session, region, provisioned_products):
     """Check CloudFormation stacks associated with provisioned products."""
     cfn_client = session.client('cloudformation', region_name=region)
     stacks = []
