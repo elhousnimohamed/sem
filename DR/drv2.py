@@ -643,3 +643,55 @@ def _format_response(result: DRCheckResult, status_code: int = 200) -> Dict[str,
         "statusCode": status_code,
         "body": json.dumps(payload, default=str)
     }
+
+def _get_portfolio_id(sc_client, name):
+    try:
+        paginator = sc_client.get_paginator("list_portfolios")
+        for page in paginator.paginate():
+            for p in page.get("PortfolioDetails", []):
+                if p["DisplayName"] == name:
+                    return p["Id"]
+        return None
+    except Exception:
+        return None
+
+
+def _get_product_id(sc_client, portfolio_id, name):
+    try:
+        paginator = sc_client.get_paginator("search_products_as_admin")
+        for page in paginator.paginate(PortfolioId=portfolio_id):
+            for view in page.get("ProductViewDetails", []):
+                summary = view.get("ProductViewSummary", {})
+                if summary.get("Name") == name:
+                    return summary.get("ProductId")
+        return None
+    except Exception:
+        return None
+
+
+def _get_provisioned_product(sc_client, product_id):
+    try:
+        paginator = sc_client.get_paginator("scan_provisioned_products")
+        for page in paginator.paginate(AccessLevelFilter={"Key": "Account", "Value": "self"}):
+            for p in page.get("ProvisionedProducts", []):
+                if p.get("ProductId") == product_id:
+                    return {"id": p.get("Id"), "name": p.get("Name"), "status": p.get("Status")}
+        return None
+    except Exception:
+        return None
+
+
+def _describe_provisioned_product_with_outputs(sc_client, pp_id):
+    try:
+        detail = sc_client.describe_provisioned_product(Id=pp_id)["ProvisionedProductDetail"]
+        outputs = []
+        last_record_id = detail.get("LastSuccessfulProvisioningRecordId")
+        if last_record_id:
+            record = sc_client.describe_record(Id=last_record_id)
+            outputs = [
+                {"Key": o["OutputKey"], "Value": o["OutputValue"]}
+                for o in record.get("RecordOutputs", [])
+            ]
+        return {"outputs": outputs, **detail}
+    except Exception:
+        return {"outputs": []}
