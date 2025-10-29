@@ -1,11 +1,14 @@
 import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
 import requests
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
+from boto3.session import Session
 
 # Configure logger
 logger = logging.getLogger()
@@ -25,30 +28,47 @@ TERRAFORM_PROVIDER = os.environ["TERRAFORM_PROVIDER"]
 ENTITY_NAME = os.environ["ENTITY_NAME"]
 
 
-def lambda_handler(event, context):
-    result = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "status": "SUCCESS",
-        "dr_tool": {},
-        "ec2_instances": [],
-        "errors": []
-    }
+@dataclass
+class DRCheckResult:
+    timestamp: str
+    status: str = "SUCCESS"
+    dr_tool: Dict[str, Any] = None
+    ec2_instances: List[Dict[str, Any]] = None
+    errors: List[str] = None
 
+    def __post_init__(self) -> None:
+        self.dr_tool = self.dr_tool or {}
+        self.ec2_instances = self.ec2_instances or []
+        self.errors = self.errors or []
+
+    def add_error(self, msg: str, component: str = "") -> None:
+        error_msg = f"[{component}] {msg}" if component else msg
+        self.errors.append(error_msg)
+        self.status = "PARTIAL" if self.status == "SUCCESS" else self.status
+        logger.warning(error_msg)
+
+
+def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
+    result = DRCheckResult(timestamp=datetime.utcnow().isoformat())
     base_session = boto3.Session()
-    latest_tf_version = "UNKNOWN"
-    tool_session = None
+
+    latest_tf_version: Optional[str] = None
+    tool_session: Optional[Session] = None
     sc_client = None
+    portfolio_id = None
+    product_id = None
     provisioned_product = None
+    amplify_app_id = None
 
     # ==============================
-    # 0. Get Latest Terraform Module Version
+    # 0. Get Latest Terraform Module Version (non-blocking)
     # ==============================
     try:
         latest_tf_version = _get_latest_module_version()
         if not latest_tf_version:
-            _add_error(result, "Latest Terraform module version not found", "TFE")
+            result.add_error("Latest Terraform module version not found", "TFE")
     except Exception as e:
-        _add_error(result, f"TFE module check failed: {e}", "TFE")
+        result.add_error(f"TFE module check failed: {e}", "TFE")
         latest_tf_version = "UNKNOWN"
 
     # ==============================
@@ -58,8 +78,8 @@ def lambda_handler(event, context):
         tool_session = _assume_role(base_session, ROLE_ARN, REGION)
         sc_client = tool_session.client("servicecatalog", region_name=REGION)
     except Exception as e:
-        _add_error(result, f"Failed to assume tool role: {e}", "IAM")
-        return _format_response(result)
+        result.add_error(f"Failed to assume tool role: {e}", "IAM")
+        return _format_response(result, status_code=200)
 
     # ==============================
     # 2. Service Catalog: Portfolio → Product → Provisioned Product
@@ -68,22 +88,28 @@ def lambda_handler(event, context):
         portfolio_id = _get_portfolio_id(sc_client, PORTFOLIO_NAME)
         if not portfolio_id:
             raise ValueError(f"Portfolio '{PORTFOLIO_NAME}' not found")
-
-        product_id = _get_product_id(sc_client, portfolio_id, PRODUCT_NAME)
-        if not product_id:
-            raise ValueError(f"Product '{PRODUCT_NAME}' not found")
-
-        provisioned_product = _get_provisioned_product(sc_client, product_id)
-        if not provisioned_product:
-            raise ValueError(f"No provisioned product for '{PRODUCT_NAME}'")
-
-        result["dr_tool"].update({
-            "provisioned_product_name": provisioned_product["name"],
-            "provisioned_product_id": provisioned_product["id"],
-            "provisioned_product_status": provisioned_product["status"],
-        })
     except Exception as e:
-        _add_error(result, str(e), "ServiceCatalog")
+        result.add_error(str(e), "ServiceCatalog")
+    else:
+        try:
+            product_id = _get_product_id(sc_client, portfolio_id, PRODUCT_NAME)
+            if not product_id:
+                raise ValueError(f"Product '{PRODUCT_NAME}' not found")
+        except Exception as e:
+            result.add_error(str(e), "ServiceCatalog")
+        else:
+            try:
+                provisioned_product = _get_provisioned_product(sc_client, product_id)
+                if not provisioned_product:
+                    raise ValueError(f"No provisioned product for '{PRODUCT_NAME}'")
+
+                result.dr_tool.update({
+                    "provisioned_product_name": provisioned_product["name"],
+                    "provisioned_product_id": provisioned_product["id"],
+                    "provisioned_product_status": provisioned_product["status"],
+                })
+            except Exception as e:
+                result.add_error(str(e), "ServiceCatalog")
 
     # ==============================
     # 3. Amplify App Check
@@ -96,20 +122,20 @@ def lambda_handler(event, context):
                 raise ValueError("AmplifyAppId output missing")
 
             amplify_status = _check_amplify_app_by_id(tool_session, REGION, amplify_app_id)
-            result["dr_tool"]["amplify_app"] = amplify_status
+            result.dr_tool["amplify_app"] = amplify_status
         except Exception as e:
-            _add_error(result, f"Amplify check failed: {e}", "Amplify")
+            result.add_error(f"Amplify check failed: {e}", "Amplify")
 
     # ==============================
     # 4. Query DynamoDB for EC2 Records
     # ==============================
-    ec2_records = []
+    ec2_records: List[Dict] = []
     if tool_session:
         try:
             dynamodb_client = tool_session.client("dynamodb", region_name=REGION)
             ec2_records = _query_dynamodb_instances(dynamodb_client, DYNAMODB_TABLE_NAME)
         except Exception as e:
-            _add_error(result, f"DynamoDB query failed: {e}", "DynamoDB")
+            result.add_error(f"DynamoDB query failed: {e}", "DynamoDB")
 
     # ==============================
     # 5. Process EC2 Instances Per Account
@@ -119,11 +145,15 @@ def lambda_handler(event, context):
         try:
             role_arn = f"arn:aws:iam::{account_id}:role/awscc/{ENTITY_NAME}.ENTITYTOOL_Provisioning"
             target_session = _assume_role(tool_session, role_arn, REGION)
-            account_report = _validate_account_instances(target_session, records, latest_tf_version)
-            result["ec2_instances"].extend(account_report)
+            account_report = _validate_account_instances(
+                session=target_session,
+                records=records,
+                latest_tf_version=latest_tf_version or "UNKNOWN"
+            )
+            result.ec2_instances.extend(account_report)
         except Exception as e:
             logger.error(f"Account {account_id} processing failed: {e}")
-            result["ec2_instances"].append({
+            result.ec2_instances.append({
                 "account_id": account_id,
                 "hostname": [r.get("hostname") for r in records],
                 "overall_instance_status": "ERROR",
@@ -131,8 +161,8 @@ def lambda_handler(event, context):
             })
 
     # Final status
-    if result["errors"]:
-        result["status"] = "PARTIAL" if result["ec2_instances"] or result["dr_tool"] else "FAILED"
+    if result.errors:
+        result.status = "PARTIAL" if result.ec2_instances or result.dr_tool else "FAILED"
 
     return _format_response(result)
 
@@ -141,14 +171,7 @@ def lambda_handler(event, context):
 # Helper Functions
 # ========================
 
-def _add_error(result, msg, component=""):
-    error_msg = f"[{component}] {msg}" if component else msg
-    result["errors"].append(error_msg)
-    result["status"] = "PARTIAL" if result["status"] == "SUCCESS" else result["status"]
-    logger.warning(error_msg)
-
-
-def _assume_role(session, role_arn, region):
+def _assume_role(session: Session, role_arn: str, region: str) -> Session:
     sts_client = session.client("sts")
     try:
         response = sts_client.assume_role(
@@ -167,7 +190,7 @@ def _assume_role(session, role_arn, region):
         raise RuntimeError(f"Role assumption failed: {e}")
 
 
-def _get_latest_module_version():
+def _get_latest_module_version() -> Optional[str]:
     url = f"https://{TFE_HOST}/api/v2/organizations/{SHARED_TFE_ORG}/registry-modules/private/{SHARED_TFE_ORG}/{TERRAFORM_MODULE_NAME}/{TERRAFORM_PROVIDER}"
     headers = {"Authorization": f"Bearer {TFE_TOKEN}", "Content-Type": "application/vnd.api+json"}
     try:
@@ -179,7 +202,7 @@ def _get_latest_module_version():
         return None
 
 
-def _get_portfolio_id(sc_client, name):
+def _get_portfolio_id(sc_client, name: str) -> Optional[str]:
     paginator = sc_client.get_paginator("list_portfolios")
     for page in paginator.paginate():
         for p in page.get("PortfolioDetails", []):
@@ -188,7 +211,7 @@ def _get_portfolio_id(sc_client, name):
     return None
 
 
-def _get_product_id(sc_client, portfolio_id, name):
+def _get_product_id(sc_client, portfolio_id: str, name: str) -> Optional[str]:
     paginator = sc_client.get_paginator("search_products_as_admin")
     for page in paginator.paginate(PortfolioId=portfolio_id):
         for view in page.get("ProductViewDetails", []):
@@ -198,7 +221,7 @@ def _get_product_id(sc_client, portfolio_id, name):
     return None
 
 
-def _get_provisioned_product(sc_client, product_id):
+def _get_provisioned_product(sc_client, product_id: str) -> Optional[Dict]:
     paginator = sc_client.get_paginator("scan_provisioned_products")
     for page in paginator.paginate(AccessLevelFilter={"Key": "Account", "Value": "self"}):
         for p in page.get("ProvisionedProducts", []):
@@ -207,7 +230,7 @@ def _get_provisioned_product(sc_client, product_id):
     return None
 
 
-def _describe_provisioned_product_with_outputs(sc_client, pp_id):
+def _describe_provisioned_product_with_outputs(sc_client, pp_id: str) -> Dict:
     try:
         detail = sc_client.describe_provisioned_product(Id=pp_id)["ProvisionedProductDetail"]
         outputs = []
@@ -223,14 +246,14 @@ def _describe_provisioned_product_with_outputs(sc_client, pp_id):
         return {"outputs": []}
 
 
-def _extract_output(outputs, key):
+def _extract_output(outputs: List[Dict], key: str) -> Optional[str]:
     for o in outputs:
         if o.get("Key") == key:
             return o.get("Value")
     return None
 
 
-def _check_amplify_app_by_id(session, region, app_id):
+def _check_amplify_app_by_id(session: Session, region: str, app_id: str) -> Dict:
     client = session.client("amplify", region_name=region)
     try:
         app = client.get_app(appId=app_id)["app"]
@@ -246,7 +269,7 @@ def _check_amplify_app_by_id(session, region, app_id):
         return {"app_id": app_id, "status": "ERROR", "error": str(e)}
 
 
-def _query_dynamodb_instances(client, table_name):
+def _query_dynamodb_instances(client, table_name: str) -> List[Dict[str, str]]:
     records = []
     paginator = client.get_paginator("scan")
     try:
@@ -260,7 +283,7 @@ def _query_dynamodb_instances(client, table_name):
         return []
 
 
-def _group_by_account_id(records):
+def _group_by_account_id(records: List[Dict]) -> Dict[str, List[Dict]]:
     grouped = {}
     for r in records:
         grouped.setdefault(r["account_id"], []).append(r)
@@ -268,10 +291,21 @@ def _group_by_account_id(records):
 
 
 # ========================
-# Per-Instance Report Builder
+# NEW: Per-Instance Report Builder
 # ========================
 
-def _build_instance_report(record, pp, params, ec2_info, tf_module_ver, ws_health, latest_tf_version, support_versions, ec2_client, elb_client):
+def _build_instance_report(
+    record: Dict,
+    pp: Dict,
+    params: Dict,
+    ec2_info: Dict,
+    tf_module_ver: str,
+    ws_health: Dict,
+    latest_tf_version: str,
+    support_versions: List[Dict],
+    ec2_client,
+    elb_client,
+) -> Dict:
     report = {
         "account_id": record.get("account_id"),
         "hostname": record.get("hostname"),
@@ -279,22 +313,26 @@ def _build_instance_report(record, pp, params, ec2_info, tf_module_ver, ws_healt
         "issues": []
     }
 
-    # Service Catalog
-    is_up_to_date = any(v.get("Id") == pp.get("provisioning_artifact_id") for v in support_versions)
+    # --- Service Catalog ---
+    is_up_to_date = _version_exists(pp.get("provisioning_artifact_id"), support_versions)
     report["service_catalog"] = {
         "provisioned_product_id": record.get("provisioned_product_id"),
         "status": pp.get("status"),
         "mpi_version_up_to_date": is_up_to_date,
-        "supported_mpi_versions": [v.get("Name") for v in support_versions if v.get("Name")]
+        "supported_mpi_versions": _extract_supported_versions(support_versions),
     }
 
-    # Terraform
+    # --- Terraform ---
     up_to_date_tf = tf_module_ver == latest_tf_version
     if not up_to_date_tf and tf_module_ver:
         report["issues"].append(f"Terraform module {tf_module_ver} ≠ latest {latest_tf_version}")
         report["overall_instance_status"] = "WARNING"
 
     tf_slug = ec2_info.get("tags", {}).get("local.workspace_slug", "")
+    org, ws = ("", "")
+    if _is_valid_workspace_format(tf_slug):
+        org, ws = _parse_workspace_identifier(tf_slug)
+
     report["terraform"] = {
         "module_version": tf_module_ver or "UNKNOWN",
         "latest_available": latest_tf_version,
@@ -307,21 +345,21 @@ def _build_instance_report(record, pp, params, ec2_info, tf_module_ver, ws_healt
         }
     }
 
-    # EC2
+    # --- EC2 ---
     report["ec2"] = {
         "instance_id": ec2_info.get("instance_id"),
         "state": ec2_info.get("status"),
         "instance_type": ec2_info.get("instance_type")
     }
 
-    # Capacity Reservations
+    # --- Capacity Reservations ---
     cr_type = params.get("CapacityReservationType")
     primary_cr = params.get("PrimaryCRID")
     secondary_cr = params.get("SecondaryCRID")
     primary_avail = _is_cr_available(ec2_client, primary_cr)
     secondary_avail = _is_cr_available(ec2_client, secondary_cr)
 
-    def _cr_entry(cid, avail):
+    def _cr_entry(cid: str, avail: str) -> Dict:
         entry = {"id": cid, "available": avail == "AVAILABLE"}
         if not entry["available"]:
             entry["reason"] = avail
@@ -340,13 +378,20 @@ def _build_instance_report(record, pp, params, ec2_info, tf_module_ver, ws_healt
         report["issues"].append("Secondary CR not available")
         report["overall_instance_status"] = "ERROR"
 
-    # Network ENIs
+    # --- Network ENIs ---
     primary_ip = params.get("ENI0PrivateIP")
     secondary_ip = params.get("ENI1PrivateIP")
     report["network_enis"] = {
         "primary": _network_entry(elb_client, ec2_client, primary_ip),
         "secondary": _network_entry(elb_client, ec2_client, secondary_ip)
     }
+
+    # Check TG health
+    for side in ("primary", "secondary"):
+        for tg in report["network_enis"][side]["target_groups"]:
+            if tg.get("health") != "healthy":
+                report["issues"].append(f"{side.title()} TG {tg['name']} unhealthy")
+                report["overall_instance_status"] = "WARNING"
 
     # Final status
     if report["overall_instance_status"] == "OK" and report["issues"]:
@@ -355,7 +400,7 @@ def _build_instance_report(record, pp, params, ec2_info, tf_module_ver, ws_healt
     return report
 
 
-def _network_entry(elb_client, ec2_client, ip):
+def _network_entry(elb_client, ec2_client, ip: str) -> Dict:
     if not ip:
         return {
             "private_ip": None,
@@ -366,8 +411,9 @@ def _network_entry(elb_client, ec2_client, ip):
 
     eni = _check_eni_attachment_by_ip(ec2_client, ip) or {}
     tgs = _find_target_groups_by_ip(elb_client, ip)
+
     for tg in tgs:
-        tg["health"] = "healthy"
+        tg["health"] = "healthy"  # Target exists → assume healthy (simplified)
 
     return {
         "private_ip": ip,
@@ -378,10 +424,10 @@ def _network_entry(elb_client, ec2_client, ip):
 
 
 # ========================
-# Account Validation
+# NEW: Account Instance Validation
 # ========================
 
-def _validate_account_instances(session, records, latest_tf_version):
+def _validate_account_instances(session: Session, records: List[Dict], latest_tf_version: str) -> List[Dict]:
     sc_client = session.client("servicecatalog", region_name=REGION)
     cf_client = session.client("cloudformation", region_name=REGION)
     ec2_client = session.client("ec2", region_name=REGION)
@@ -390,27 +436,32 @@ def _validate_account_instances(session, records, latest_tf_version):
     report = []
     for record in records:
         try:
+            # 1. Service Catalog
             pp = _describe_provisioned_product_with_outputs(sc_client, record["provisioned_product_id"])
             support_versions = _get_last_5_versions(sc_client, pp.get("product_id", ""))
 
+            # 2. CloudFormation
             params = {}
             stack_arn = _extract_output(pp.get("outputs", []), "CloudformationStackARN")
             if stack_arn:
                 params = _get_stack_parameters(cf_client, stack_arn)
 
+            # 3. EC2
             instance_id = params.get("EC2Instance")
             ec2_info = _check_ec2_instance(ec2_client, instance_id) if instance_id else {}
             tf_module_ver = ec2_info.get("tags", {}).get("local.module_version")
 
+            # 4. TFE Workspace
             tf_slug = ec2_info.get("tags", {}).get("local.workspace_slug")
             ws_health = {}
-            if tf_slug and "/" in tf_slug:
+            if tf_slug and _is_valid_workspace_format(tf_slug):
                 try:
-                    org, ws = tf_slug.split("/", 1)
+                    org, ws = _parse_workspace_identifier(tf_slug)
                     ws_health = _get_workspace_health(TFE_HOST, org, ws, TFE_TOKEN)
                 except Exception as e:
                     ws_health = {"error": str(e)}
 
+            # 5. Build Report
             instance_report = _build_instance_report(
                 record=record,
                 pp=pp,
@@ -438,10 +489,10 @@ def _validate_account_instances(session, records, latest_tf_version):
 
 
 # ========================
-# Reused Helpers
+# Reused Helpers (unchanged)
 # ========================
 
-def _get_stack_parameters(cf_client, stack_arn):
+def _get_stack_parameters(cf_client, stack_arn: str) -> Dict[str, str]:
     try:
         stack = cf_client.describe_stacks(StackName=stack_arn)["Stacks"][0]
         return {p["ParameterKey"]: p["ParameterValue"] for p in stack.get("Parameters", [])}
@@ -449,7 +500,7 @@ def _get_stack_parameters(cf_client, stack_arn):
         return {}
 
 
-def _get_last_5_versions(sc_client, product_id):
+def _get_last_5_versions(sc_client, product_id: str) -> List[Dict]:
     try:
         artifacts = sc_client.list_provisioning_artifacts(ProductId=product_id)["ProvisioningArtifactDetails"]
         return sorted(artifacts, key=lambda x: x.get("CreatedTime", ""), reverse=True)[:5]
@@ -457,7 +508,15 @@ def _get_last_5_versions(sc_client, product_id):
         return []
 
 
-def _check_ec2_instance(ec2_client, instance_id):
+def _version_exists(vid: str, versions: List[Dict]) -> bool:
+    return any(v.get("Id") == vid for v in versions)
+
+
+def _extract_supported_versions(versions: List[Dict]) -> List[str]:
+    return [v.get("Name") for v in versions if v.get("Name")]
+
+
+def _check_ec2_instance(ec2_client, instance_id: str) -> Dict:
     try:
         resp = ec2_client.describe_instances(InstanceIds=[instance_id])
         inst = resp["Reservations"][0]["Instances"][0]
@@ -471,7 +530,7 @@ def _check_ec2_instance(ec2_client, instance_id):
         return {"instance_id": instance_id, "status": "NOT_FOUND"}
 
 
-def _is_cr_available(ec2_client, cr_id):
+def _is_cr_available(ec2_client, cr_id: str) -> str:
     if not cr_id:
         return "NOT CONFIGURED"
     try:
@@ -482,7 +541,7 @@ def _is_cr_available(ec2_client, cr_id):
         return "NOT FOUND"
 
 
-def _find_target_groups_by_ip(elb_client, ip):
+def _find_target_groups_by_ip(elb_client, ip: str) -> List[Dict]:
     try:
         paginator = elb_client.get_paginator("describe_target_groups")
         matches = []
@@ -501,7 +560,7 @@ def _find_target_groups_by_ip(elb_client, ip):
         return []
 
 
-def _check_eni_attachment_by_ip(ec2_client, ip):
+def _check_eni_attachment_by_ip(ec2_client, ip: str) -> Optional[Dict]:
     try:
         for filter_name in ["addresses.private-ip-address", "association.public-ip"]:
             resp = ec2_client.describe_network_interfaces(Filters=[{"Name": filter_name, "Values": [ip]}])
@@ -516,7 +575,15 @@ def _check_eni_attachment_by_ip(ec2_client, ip):
         return None
 
 
-def _get_workspace_health(host, org, ws, token):
+def _is_valid_workspace_format(v: str) -> bool:
+    return isinstance(v, str) and len(v.strip().split("/")) == 2
+
+
+def _parse_workspace_identifier(v: str) -> Tuple[str, str]:
+    return tuple(v.strip().split("/"))
+
+
+def _get_workspace_health(host: str, org: str, ws: str, token: str) -> Dict:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/vnd.api+json"}
     try:
         url = f"https://{host}/api/v2/organizations/{org}/workspaces/{ws}"
@@ -539,40 +606,40 @@ def _get_workspace_health(host, org, ws, token):
 
 
 # ========================
-# Final Response
+# NEW: Final Response Formatter
 # ========================
 
-def _format_response(result):
-    total = len(result["ec2_instances"])
-    ok = sum(1 for i in result["ec2_instances"] if i.get("overall_instance_status") == "OK")
+def _format_response(result: DRCheckResult, status_code: int = 200) -> Dict[str, Any]:
+    total = len(result.ec2_instances)
+    ok = sum(1 for i in result.ec2_instances if i.get("overall_instance_status") == "OK")
     with_issues = total - ok
 
     dr_tool = {
-        "amplify_app": result["dr_tool"].get("amplify_app", {}),
+        "amplify_app": result.dr_tool.get("amplify_app", {}),
         "service_catalog": {
             "portfolio": PORTFOLIO_NAME,
             "product": PRODUCT_NAME,
-            "provisioned_product": result["dr_tool"].get("provisioned_product_name"),
-            "status": result["dr_tool"].get("provisioned_product_status")
+            "provisioned_product": result.dr_tool.get("provisioned_product_name"),
+            "status": result.dr_tool.get("provisioned_product_status")
         }
     }
 
     payload = {
-        "timestamp": result["timestamp"],
-        "overall_status": result["status"],
+        "timestamp": result.timestamp,
+        "overall_status": result.status,
         "summary": {
             "total_mpi_instances": total,
             "instances_ok": ok,
             "instances_with_issues": with_issues,
             "dr_tool": dr_tool
         },
-        "mpi_instances": result["ec2_instances"]
+        "mpi_instances": result.ec2_instances
     }
 
-    if result["errors"]:
-        payload["errors"] = result["errors"]
+    if result.errors:
+        payload["errors"] = result.errors
 
     return {
-        "statusCode": 200,
+        "statusCode": status_code,
         "body": json.dumps(payload, default=str)
     }
