@@ -695,3 +695,66 @@ def _describe_provisioned_product_with_outputs(sc_client, pp_id):
         return {"outputs": outputs, **detail}
     except Exception:
         return {"outputs": []}
+
+
+import requests
+from typing import Dict
+
+def _get_workspace_health(host: str, org: str, ws: str, token: str) -> Dict:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/vnd.api+json"
+    }
+
+    try:
+        # --- Get workspace details ---
+        url = f"https://{host}/api/v2/organizations/{org}/workspaces/{ws}"
+        resp = requests.get(url, headers=headers, timeout=10, verify=False)
+        resp.raise_for_status()
+        data = resp.json()["data"]
+        ws_id = data["id"]
+
+        # --- Get latest run ---
+        runs = requests.get(
+            f"https://{host}/api/v2/workspaces/{ws_id}/runs?page[size]=1",
+            headers=headers,
+            verify=False
+        )
+        runs.raise_for_status()
+        latest_run = runs.json().get("data", [{}])[0]
+
+        # --- Base workspace info ---
+        result = {
+            "organization": org,
+            "workspace": ws,
+            "locked": data["attributes"].get("locked", False),
+            "terraform_version": data["attributes"].get("terraform-version", "Unknown"),
+            "latest_run_status": latest_run.get("attributes", {}).get("status", "No runs"),
+        }
+
+        # --- Check for assessments ---
+        if data["attributes"].get("assessments-enabled", False):
+            status_url = f"https://{host}/api/v2/workspaces/{ws_id}/current-assessment-status"
+            status_resp = requests.get(status_url, headers=headers, verify=False)
+            if status_resp.status_code == 404:
+                # No current assessment found
+                result["current_assessment_status"] = "No current assessment"
+            else:
+                status_resp.raise_for_status()
+                status_data = status_resp.json().get("data", {})
+                attr = status_data.get("attributes", {})
+                result["current_assessment_status"] = {
+                    "status": attr.get("status", "Unknown"),
+                    "drift": attr.get("has-drift", False),
+                    "updated_at": attr.get("updated-at"),
+                    "run_id": attr.get("run-id"),
+                    "assessment_id": attr.get("assessment-id"),
+                }
+        else:
+            result["current_assessment_status"] = "Assessments not enabled"
+
+        return result
+
+    except Exception as e:
+        return {"error": str(e)}
+
