@@ -1,6 +1,5 @@
 """
 AWS Lambda: Disaster Recovery Pre-Check
-Optimized for performance, security, and reliability
 """
 import json
 import logging
@@ -19,14 +18,19 @@ from boto3.session import Session
 # ============================================================================
 
 # Configure logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+log_levels = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARN": logging.WARN,
+    "ERROR": logging.ERROR,
+}
 LOGGER = logging.getLogger()
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOGGER.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+LOGGER.setLevel(log_levels[LOG_LEVEL])
 
 # Custom certificate handling
 CERT_PATH = '/tmp/cert.pem'
-CERT_CONTENT = """
-MY certificate
+CERT_CONTENT = """Cert content
 """
 
 # Write certificate during cold start (only once)
@@ -37,7 +41,6 @@ try:
         LOGGER.info("Certificate written successfully")
 except IOError as e:
     LOGGER.error(f"Failed to write certificate: {e}")
-    # Don't raise - allow function to continue if cert isn't critical
 
 # Environment variables with validation
 def _get_required_env(key: str) -> str:
@@ -53,24 +56,37 @@ try:
     PORTFOLIO_NAME = _get_required_env("PORTFOLIO_NAME")
     PRODUCT_NAME = _get_required_env("PRODUCT_NAME")
     DYNAMODB_TABLE_NAME = _get_required_env("DYNAMODB_TABLE_NAME")
+    DYNAMODB_CONFIG_TABLE_NAME = _get_required_env("DYNAMODB_CONFIG_TABLE_NAME")
     TFE_HOST = _get_required_env("TFE_HOST")
-    TFE_TOKEN = os.environ.get("TERRAFORM_API_TOKEN", "")
     SHARED_TFE_ORG = _get_required_env("SHARED_TFE_ORG")
     TERRAFORM_MODULE_NAME = _get_required_env("TERRAFORM_MODULE_NAME")
     TERRAFORM_PROVIDER = _get_required_env("TERRAFORM_PROVIDER")
     ENTITY_NAME = _get_required_env("ENTITY_NAME")
 except ValueError as e:
     LOGGER.error(f"Configuration error: {e}")
-    # Re-raise to fail fast during initialization
-    raise
+    
 
-# Reusable HTTP session for Terraform Enterprise API
-TFE_SESSION = requests.Session()
-TFE_SESSION.headers.update({
-    "Authorization": f"Bearer {TFE_TOKEN}",
-    "Content-Type": "application/vnd.api+json"
-})
-TFE_SESSION.verify = CERT_PATH
+# Get global configuration from dynamodb table
+def get_configuration():
+    config = {}
+    dynamodb_resource = boto3.resource("dynamodb")
+    ddb_config_table = dynamodb_resource.Table(DYNAMODB_CONFIG_TABLE_NAME)
+    ddb_res = ddb_config_table.scan()
+    ddb_data = ddb_res["Items"]
+    while "LastEvaluatedKey" in ddb_res:
+        ddb_res = ddb_config_table.scan(ExclusiveStartKey=ddb_res["LastEvaluatedKey"])
+        ddb_data.extend(ddb_res["Items"])
+    for item in ddb_data:
+        config[item["name"]] = item["value"]
+
+    LOGGER.info(f"Running with configuration: {config}")
+    return config
+
+
+# ============================================================================
+# Get Configuration from dynamodb table
+# ============================================================================
+CONFIG = get_configuration()
 
 # Connection timeout constants
 HTTP_TIMEOUT = 15  # seconds
@@ -79,6 +95,32 @@ AWS_CLIENT_CONFIG = boto3.session.Config(
     read_timeout=30,
     retries={'max_attempts': 3, 'mode': 'standard'}
 )
+
+def _get_tfe_token() -> str:
+    LOGGER.info("Retrieving TFE token from secrets manager...")
+    sm_client = boto3.client("secretsmanager", region_name=REGION, config=AWS_CLIENT_CONFIG)
+    try:
+        value = sm_client.get_secret_value(
+            SecretId=CONFIG["TFE_TOKEN_SECRET_ARN"],
+        )
+        secret_json = json.loads(value["SecretString"])
+        return secret_json["TFE_TOKEN"]
+    except Exception as e:
+        LOGGER.error(f"Error retrieving TFE token: {e}")
+
+# Get TFE token
+try:
+    TFE_TOKEN = _get_tfe_token()
+except Exception as e:
+        LOGGER.error(f"Error retrieving TFE token: {e}")
+
+# Reusable HTTP session for Terraform Enterprise API
+TFE_SESSION = requests.Session()
+TFE_SESSION.headers.update({
+    "Authorization": f"Bearer {TFE_TOKEN}",
+    "Content-Type": "application/vnd.api+json"
+})
+TFE_SESSION.verify = CERT_PATH
 
 # ============================================================================
 # DATA STRUCTURES
@@ -116,9 +158,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         API Gateway compatible response with statusCode and body
     """
-    # Log basic invocation info (avoid logging sensitive data)
-    LOGGER.info(f"Lambda invoked - Request ID: {context.request_id}")
-    LOGGER.debug(f"Event type: {event.get('httpMethod', 'direct')}")
+    
+    LOGGER.info('## EVENT')
+    LOGGER.info(f"## Received event: {json.dumps(event, default=str)}")
+    
+    LOGGER.info('## ENVIRONMENT VARIABLES')
+    LOGGER.info(json.dumps(dict(os.environ)))
+    
+    LOGGER.info('## CALLER')
+    LOGGER.info(json.dumps(boto3.client('sts').get_caller_identity()))
     
     # Initialize result object
     result = DRCheckResult(timestamp=datetime.now(timezone.utc).isoformat())
@@ -364,7 +412,6 @@ def _add_account_error(result: DRCheckResult, account_id: str, records: List[Dic
     """Add account-level error to result"""
     result.ec2_instances.append({
         "account_id": account_id,
-        "hostname": [r.get("hostname", "N/A") for r in records],
         "overall_instance_status": "ERROR",
         "issues": [f"Account-level failure: {error}"]
     })
@@ -482,9 +529,7 @@ def _scan_dynamodb_instances(client, table_name: str) -> List[Dict[str, str]]:
         paginator = client.get_paginator("scan")
         for page in paginator.paginate(TableName=table_name):
             for item in page.get("Items", []):
-                # Convert DynamoDB item to plain dict (handle S type only)
                 record = {k: v.get("S", "") for k, v in item.items() if "S" in v}
-                # Validate required fields
                 if "account_id" in record and "provisioned_product_id" in record:
                     records.append(record)
         return records
@@ -533,8 +578,6 @@ def _validate_account_instances(
             )
             report.append(instance_report)
             
-            # TODO: Remove break for production (currently processes only 1 instance)
-            break
             
         except Exception as e:
             LOGGER.exception(f"Instance validation failed for {record.get('hostname', 'N/A')}")
@@ -791,7 +834,7 @@ def _check_eni_by_ip(ec2_client, ip: str) -> Dict:
     
     try:
         # Try private IP first
-        for filter_name in ["addresses.private-ip-address", "association.public-ip"]:
+        for filter_name in ["addresses.private-ip-address"]:
             try:
                 resp = ec2_client.describe_network_interfaces(
                     Filters=[{"Name": filter_name, "Values": [ip]}]
@@ -855,9 +898,6 @@ def _find_target_groups_by_ip(elb_client, ip: str) -> List[Dict]:
 
 def _get_stack_parameters(cf_client, stack_arn: str) -> Dict[str, str]:
     """Get CloudFormation stack parameters"""
-    if not stack_arn:
-        return {}
-    
     try:
         resp = cf_client.describe_stacks(StackName=stack_arn)
         stacks = resp.get("Stacks", [])
@@ -1046,12 +1086,7 @@ def _format_response(result: DRCheckResult, status_code: int = 200) -> Dict[str,
     if result.errors:
         payload["errors"] = result.errors
     
-    # Return API Gateway compatible response
     return {
         "statusCode": status_code,
-        "headers": {
-            "Content-Type": "application/json",
-            "X-Request-Status": result.status
-        },
         "body": json.dumps(payload, default=str, indent=2)
     }
