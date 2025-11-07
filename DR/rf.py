@@ -30,7 +30,8 @@ LOGGER.setLevel(log_levels[LOG_LEVEL])
 
 # Custom certificate handling
 CERT_PATH = '/tmp/cert.pem'
-CERT_CONTENT = """Cert content
+CERT_CONTENT = """ 
+cert content
 """
 
 # Write certificate during cold start (only once)
@@ -186,10 +187,23 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Step 2: Query Service Catalog
         _query_service_catalog(tool_session, result)
         
-        # Step 3: Query DynamoDB for EC2 records
+        # Step3 : Amplify App Check
+        if result.dr_tool.get("provisioned_product_id"):
+            sc_client = tool_session.client("servicecatalog", region_name=REGION, config=AWS_CLIENT_CONFIG)
+            product_details = _describe_provisioned_product_with_outputs(sc_client, result.dr_tool["provisioned_product_id"])
+            amplify_app_id = _extract_output(product_details.get("outputs", []), "AmplifyAppId")
+            if amplify_app_id:
+                LOGGER.info(f"Found Amplify application ID: {amplify_app_id}")
+                amplify_status = _check_amplify_app(tool_session, amplify_app_id)
+                result.dr_tool["amplify_app"] = amplify_status
+                LOGGER.info(f"Amplify application status: {amplify_status.get('status')}")
+            else:
+                result.add_error("AmplifyAppId output missing", "Amplify")
+        
+        # Step 4: Query DynamoDB for EC2 records
         ec2_records = _query_dynamodb_records(tool_session, result)
         
-        # Step 4: Process EC2 instances per account
+        # Step 5: Process EC2 instances per account
         _process_ec2_instances(tool_session, ec2_records, latest_tf_version, result)
         
         # Determine final status
@@ -316,7 +330,22 @@ def _query_service_catalog(tool_session: Session, result: DRCheckResult) -> None
     except Exception as e:
         result.add_error(f"Service Catalog query failed: {str(e)}", "ServiceCatalog")
 
-
+def _check_amplify_app(tool_session: Session, app_id : str ):
+    """Check Amplify application status"""
+    LOGGER.info(f"Checking Amplify application with id: {app_id}")
+    try:
+        client = tool_session.client("amplify", region_name=REGION, config=AWS_CLIENT_CONFIG)
+        app = client.get_app(appId=app_id)["app"]
+        return {"app_id": app_id, "status": "ACTIVE", "name": app.get("name")}
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        return {
+            "app_id": app_id,
+            "status": "NOT_FOUND" if code == "NotFoundException" else "ERROR",
+            "error": str(e)
+        }
+    except Exception as e:
+        return {"app_id": app_id, "status": "ERROR", "error": str(e)}
 def _query_dynamodb_records(tool_session: Session, result: DRCheckResult) -> List[Dict]:
     """Query DynamoDB for EC2 instance records"""
     LOGGER.info(f"Querying DynamoDB table: {DYNAMODB_TABLE_NAME}")
