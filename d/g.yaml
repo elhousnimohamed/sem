@@ -1,0 +1,28 @@
+listen:
+  port: 8080
+  public_url: https://claude-gateway.apps.internal.example.com
+  trusted_proxies: ["10.128.0.0/14"]        # CIDR pods du router OpenShift
+oidc:
+  issuer: https://pingfed.example.com
+  client_id: claude-gateway
+  token_endpoint_auth_method: private_key_jwt
+  client_assertion:
+    private_key_pem: ${file:/etc/gateway/oidc/idp-client.key}
+    certificate_pem: ${file:/etc/gateway/oidc/idp-client.crt}
+  scopes: [openid, profile, email, offline_access]
+  # userinfo_fallback: true                 # si email/groups pas dans l'id_token
+  # ca_cert_pem: ${file:/etc/gateway/ca/ca.crt}   # PKI interne
+session:
+  jwt_secret: ${GATEWAY_JWT_SECRET}         # openssl rand -base64 32
+  ttl_hours: 8
+store:
+  postgres_url: ${GATEWAY_POSTGRES_URL}
+upstreams:
+  - provider: bedrock
+    region: eu-west-3
+    auth: {}                                # chaîne de credentials AWS par défaut
+# Hors US : mapper les IDs (vérifie avec `aws bedrock list-inference-profiles`)
+# models:
+#   - id: claude-sonnet-4-6
+#     upstream_model:
+#       bedrock: eu.anthropic.claude-sonnet-4-6
