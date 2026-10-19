@@ -1,4 +1,6 @@
 pip install cryptography
+oc create secret generic gateway-oidc --from-file=idp-client.key --from-file=idp-client.crt
+
 import base64, hashlib, json, datetime
 from cryptography import x509
 from cryptography.x509.oid import NameOID
