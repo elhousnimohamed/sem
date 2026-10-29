@@ -1,0 +1,301 @@
+# gateway.yaml - Claude apps gateway (claude gateway --config <ce fichier>)
+# Valeurs entre <chevrons> : a remplacer. Secrets via ${VAR} ou ${file:/chemin}.
+
+listen:
+  host: 0.0.0.0
+  port: 8080
+  public_url: "https://<GATEWAY_HOSTNAME>"
+  # trusted_proxies: ["<CIDR_ROUTEUR_OPENSHIFT>"]
+
+oidc:
+  issuer: "<OIDC_ISSUER_URL>"
+  client_id: "<OIDC_CLIENT_ID>"
+  token_endpoint_auth_method: private_key_jwt
+  client_assertion:
+    private_key_pem: ${file:/etc/gateway/oidc/idp-client.key}
+    certificate_pem: ${file:/etc/gateway/oidc/idp-client.crt}
+  allowed_email_domains:
+    - "<EMAIL_DOMAIN>"
+  # use_proxy: true
+
+session:
+  jwt_secret: ${GATEWAY_JWT_SECRET}
+
+store:
+  postgres_url: ${GATEWAY_POSTGRES_URL}
+
+upstreams:
+  - provider: bedrock
+    region: "<AWS_REGION>"
+    auth: {}
+    # base_url: "https://<VPCE_BEDROCK_RUNTIME_DNS>"
+
+auto_include_builtin_models: true
+# models:
+#   - id: <MODEL_ID>
+#     label: <LABEL>
+#     upstream_model:
+#       bedrock: <INFERENCE_PROFILE_ID_OR_ARN>
+
+managed:
+  policies:
+    - match: {}
+      cli:
+        allowManagedHooksOnly: true
+        allowManagedPermissionRulesOnly: true
+        cleanupPeriodDays: 30
+        companyAnnouncements:
+          - 'Corporate policy: Claude Code is approved for internal development only. Do not paste customer data, PII, or production secrets. Bypass mode is disabled. Security contact: mathieu.payet@axa.com. GO CloudBrokers: ikram.bejaoui@axa.com, mohamed.elhousni@axa.com. Leaddev: mohammed.jennane@axa.com. PO: marvin.kraus@axa.com | Full policy: https://wiki.corp.internal/ai/claude-code'
+        disableAllHooks: true
+        env:
+          BASH_DEFAULT_TIMEOUT_MS: '120000'
+          BASH_MAX_TIMEOUT_MS: '600000'
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+          CLAUDE_CODE_ENABLE_TELEMETRY: '1'
+          DISABLE_TELEMETRY: '0'
+          MAX_THINKING_TOKENS: '32000'
+          MCP_TIMEOUT: '60000'
+        permissions:
+          additionalDirectories: []
+          allow:
+            - Read
+            - Edit
+            - Glob
+            - Grep
+            - Bash(ls:*)
+            - Bash(cat:*)
+            - Bash(head:*)
+            - Bash(tail:*)
+            - Bash(wc:*)
+            - Bash(grep:*)
+            - Bash(rg:*)
+            - Bash(find:*)
+            - Bash(fd:*)
+            - Bash(tree:*)
+            - Bash(pwd)
+            - Bash(echo:*)
+            - Bash(which:*)
+            - Bash(whoami)
+            - Bash(date:*)
+            - Bash(env)
+            - Bash(git status:*)
+            - Bash(git diff:*)
+            - Bash(git log:*)
+            - Bash(git show:*)
+            - Bash(git branch:*)
+            - Bash(git fetch:*)
+            - Bash(git pull:*)
+            - Bash(git add:*)
+            - Bash(git commit:*)
+            - Bash(git stash:*)
+            - Bash(git checkout:*)
+            - Bash(git switch:*)
+            - Bash(git restore:*)
+            - Bash(git merge:*)
+            - Bash(npm test:*)
+            - Bash(npm run test:*)
+            - Bash(npm run lint:*)
+            - Bash(npm run build:*)
+            - Bash(npm run dev:*)
+            - Bash(yarn test:*)
+            - Bash(yarn lint:*)
+            - Bash(yarn build:*)
+            - Bash(pnpm test:*)
+            - Bash(pnpm lint:*)
+            - Bash(pnpm build:*)
+            - Bash(pytest:*)
+            - Bash(python -m pytest:*)
+            - Bash(ruff check:*)
+            - Bash(ruff format:*)
+            - Bash(mypy:*)
+            - Bash(black:*)
+            - Bash(go test:*)
+            - Bash(go build:*)
+            - Bash(go vet:*)
+            - Bash(go fmt:*)
+            - Bash(cargo test:*)
+            - Bash(cargo build:*)
+            - Bash(cargo check:*)
+            - Bash(cargo clippy:*)
+            - Bash(cargo fmt:*)
+            - Bash(make:*)
+            - Bash(just:*)
+            - Bash(task:*)
+            - Bash(jq:*)
+            - Bash(yq:*)
+            - Bash(sed:*)
+            - Bash(awk:*)
+            - Bash(sort:*)
+            - Bash(uniq:*)
+            - Bash(diff:*)
+            - Bash(kubectl get:*)
+            - Bash(kubectl describe:*)
+            - Bash(kubectl logs:*)
+            - Bash(terraform fmt:*)
+            - Bash(terraform validate:*)
+            - Bash(terraform init:*)
+            - Bash(terraform plan:*)
+            - WebFetch(domain:docs.claude.com)
+            - WebFetch(domain:docs.anthropic.com)
+            - WebFetch(domain:github.com)
+            - WebFetch(domain:raw.githubusercontent.com)
+            - WebFetch(domain:api.github.com)
+            - WebFetch(domain:gist.github.com)
+            - WebFetch(domain:registry.npmjs.org)
+            - WebFetch(domain:www.npmjs.com)
+            - WebFetch(domain:pypi.org)
+            - WebFetch(domain:files.pythonhosted.org)
+            - WebFetch(domain:crates.io)
+            - WebFetch(domain:docs.rs)
+            - WebFetch(domain:pkg.go.dev)
+            - WebFetch(domain:mvnrepository.com)
+            - WebFetch(domain:stackoverflow.com)
+            - WebFetch(domain:developer.mozilla.org)
+          ask:
+            - Bash(git push:*)
+            - Bash(git push --force:*)
+            - Bash(git push -f:*)
+            - Bash(git reset --hard:*)
+            - Bash(git clean:*)
+            - Bash(git rebase:*)
+            - Bash(npm install:*)
+            - Bash(npm i:*)
+            - Bash(npm publish:*)
+            - Bash(npm link:*)
+            - Bash(yarn add:*)
+            - Bash(yarn install:*)
+            - Bash(pnpm install:*)
+            - Bash(pnpm add:*)
+            - Bash(pip install:*)
+            - Bash(pip3 install:*)
+            - Bash(uv add:*)
+            - Bash(uv pip install:*)
+            - Bash(poetry add:*)
+            - Bash(cargo add:*)
+            - Bash(cargo install:*)
+            - Bash(go install:*)
+            - Bash(gem install:*)
+            - Bash(brew install:*)
+            - Bash(choco install:*)
+            - Bash(docker run:*)
+            - Bash(docker exec:*)
+            - Bash(docker push:*)
+            - Bash(docker build:*)
+            - Bash(docker compose up:*)
+            - Bash(podman run:*)
+            - Bash(kubectl apply:*)
+            - Bash(kubectl create:*)
+            - Bash(kubectl patch:*)
+            - Bash(kubectl exec:*)
+            - Bash(kubectl port-forward:*)
+            - Bash(helm install:*)
+            - Bash(helm upgrade:*)
+            - Bash(terraform apply:*)
+            - Bash(pulumi up:*)
+            - Bash(ansible-playbook:*)
+            - Bash(psql:*)
+            - Bash(mysql:*)
+            - Bash(mongosh:*)
+            - Bash(redis-cli:*)
+            - WebFetch
+          defaultMode: default
+          deny:
+            - Read(**/.env)
+            - Read(**/.env.*)
+            - Read(**/*.pem)
+            - Read(**/*.key)
+            - Read(**/id_rsa)
+            - Read(**/id_rsa.pub)
+            - Read(**/id_ed25519)
+            - Read(**/id_ecdsa)
+            - Read(**/credentials)
+            - Read(**/credentials.json)
+            - Read(**/service-account*.json)
+            - Read(**/.aws/**)
+            - Read(**/.azure/**)
+            - Read(**/.gcloud/**)
+            - Read(**/.ssh/**)
+            - Read(**/.kube/config)
+            - Read(**/.netrc)
+            - Read(**/.npmrc)
+            - Read(**/.pypirc)
+            - Read(**/.docker/config.json)
+            - Read(**/secrets/**)
+            - Read(**/*.p12)
+            - Read(**/*.pfx)
+            - Read(**/*.keystore)
+            - Edit(**/.env)
+            - Edit(**/.env.*)
+            - Edit(**/.ssh/**)
+            - Edit(**/.aws/**)
+            - Edit(**/secrets/**)
+            - Bash(sudo:*)
+            - Bash(su:*)
+            - Bash(doas:*)
+            - Bash(rm -rf /*)
+            - Bash(rm -rf ~/*)
+            - Bash(rm -rf ~)
+            - Bash(rm -rf $HOME*)
+            - Bash(shutdown:*)
+            - Bash(reboot:*)
+            - Bash(halt:*)
+            - Bash(poweroff:*)
+            - Bash(mkfs:*)
+            - Bash(dd if=*)
+            - Bash(chmod -R 777:*)
+            - Bash(chown -R:*)
+            - Bash(curl:*)
+            - Bash(wget:*)
+            - Bash(nc:*)
+            - Bash(ncat:*)
+            - Bash(socat:*)
+            - Bash(ssh:*)
+            - Bash(scp:*)
+            - Bash(sftp:*)
+            - Bash(ftp:*)
+            - Bash(aws iam:*)
+            - Bash(aws sts:*)
+            - Bash(az role:*)
+            - Bash(gcloud iam:*)
+            - Bash(kubectl delete:*)
+            - Bash(terraform destroy:*)
+            - Bash(helm delete:*)
+            - Bash(helm uninstall:*)
+            - Bash(history -c:*)
+            - Bash(eval:*)
+            - Bash(base64 -d:*)
+            - Bash(xxd -r:*)
+            - Bash(python -c:*)
+            - Bash(python3 -c:*)
+            - Bash(node -e:*)
+            - Bash(node --eval:*)
+            - Bash(ruby -e:*)
+            - Bash(perl -e:*)
+          disableBypassPermissionsMode: disable
+        sandbox:
+          autoAllowBashIfSandboxed: false
+          enabled: true
+          excludedCommands:
+            - rm -rf /
+            - rm -rf /*
+            - shutdown
+            - reboot
+            - mkfs
+            - dd if=/dev/zero
+          network:
+            allowUnixSockets: []
+            allowedDomains:
+              - api.anthropic.com
+              - github.com
+              - api.github.com
+              - raw.githubusercontent.com
+              - registry.npmjs.org
+              - pypi.org
+              - files.pythonhosted.org
+        strictKnownMarketplaces: []
+
+
+# telemetry:
+#   forward_to:
+#     - url: "https://<OTLP_COLLECTOR>"
+#       metrics: true
