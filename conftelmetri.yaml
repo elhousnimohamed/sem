@@ -13,3 +13,8 @@ env:
   - name: CW_API_KEY
     valueFrom:
       secretKeyRef: {name: cw-otlp, key: CW_API_KEY}
+
+curl -i -X POST "https://monitoring.<region>.amazonaws.com/v1/metrics" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <secret>" \
+  -d '{"resourceMetrics":[]}'
