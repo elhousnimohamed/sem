@@ -1,0 +1,15 @@
+telemetry:
+  forward_to:
+    - url: https://monitoring.<region>.amazonaws.com
+      headers:
+        Authorization: "Bearer ${CW_API_KEY}"
+      metrics: true
+      logs: false
+      traces: false
+  resource_attributes:        # optional, needs gateway v2.1.281+
+    organization: <org>
+    environment: prod
+env:
+  - name: CW_API_KEY
+    valueFrom:
+      secretKeyRef: {name: cw-otlp, key: CW_API_KEY}
