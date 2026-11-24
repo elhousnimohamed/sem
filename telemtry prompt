@@ -1,0 +1,244 @@
+Task: Generate Terraform Infrastructure for AWS CloudWatch Metrics Telemetry
+
+Act as a senior AWS DevOps / Platform Engineer with strong expertise in Terraform, AWS IAM, Amazon CloudWatch, OpenTelemetry (OTLP), and OpenShift.
+
+I need you to generate production-ready Terraform code to provision the AWS infrastructure required to collect Claude Code Gateway metrics telemetry in Amazon CloudWatch.
+
+1. Context and architecture
+
+My environment consists of:
+
+Claude Code Gateway running on OpenShift.
+The gateway exposes telemetry using OpenTelemetry (OTLP).
+The gateway forwards metrics directly to Amazon CloudWatch using the OTLP HTTP endpoint.
+AWS CloudWatch is used for metrics storage and visualization.
+I want to use the CloudWatch GenAI Observability / Coding Agent Insights dashboard to monitor Claude Code usage.
+The OpenShift gateway accesses AWS through an HTTP/HTTPS proxy (Squid).
+
+The target AWS region is:
+
+eu-west-1 (Ireland).
+
+The telemetry endpoint is:
+
+https://monitoring.eu-west-1.amazonaws.com/v1/metrics
+
+Authentication uses an AWS service-specific API key with Bearer token authentication.
+
+Scope restriction:
+
+For now, implement METRICS ONLY.
+
+Do not implement:
+
+CloudWatch Logs telemetry.
+AWS X-Ray traces.
+Transaction Search.
+Any additional telemetry destinations.
+2. AWS resources to provision
+
+Generate Terraform code for the following resources.
+
+A. IAM user for CloudWatch Metrics
+
+Create a dedicated IAM user:
+
+cw-claude-gateway-metrics
+
+Requirements:
+
+Follow the principle of least privilege.
+Attach the appropriate AWS-managed or custom IAM policy required for CloudWatch Metrics API key generation.
+Do not grant administrator permissions.
+Do not grant CloudWatch Logs or X-Ray permissions.
+Clearly explain which permissions are required to generate and manage service-specific credentials.
+B. IAM permissions
+
+Identify and implement the correct IAM permissions required for:
+
+Creating a CloudWatch service-specific credential.
+Managing or rotating the credential.
+Sending OTLP metrics to CloudWatch, if additional permissions are required.
+
+Important: Distinguish between permissions needed by the IAM provisioning identity and permissions needed by the telemetry API key.
+
+Do not assume that the API key requires standard SigV4 permissions.
+
+Verify the correct AWS service name for the credential: cloudwatch.amazonaws.com
+
+C. CloudWatch API key
+
+Investigate whether Terraform supports creating an IAM service-specific credential for CloudWatch.
+
+If supported:
+
+Implement it using the appropriate Terraform resource.
+Set the credential expiration to 90 days.
+
+If Terraform cannot retrieve or manage the credential secret securely:
+
+Explain the limitation.
+Provide a secure alternative using AWS CLI or another supported mechanism.
+Do not invent Terraform resources or unsupported arguments.
+Never expose secrets in Terraform outputs.
+D. Secrets Manager
+
+If technically appropriate, create an AWS Secrets Manager secret to store the CloudWatch Metrics API key.
+
+Requirements:
+
+Secret name: claude-code/cloudwatch/metrics
+Encryption using AWS KMS.
+Restrict access to authorized administrators and the rotation/provisioning process.
+Avoid exposing the secret in Terraform state or outputs where possible.
+Explain Terraform state security implications.
+
+If automatic API key storage is supported natively by AWS, explain how it works and whether Terraform can integrate with it.
+
+E. CloudWatch configuration
+
+Identify whether any additional CloudWatch resource needs to be provisioned for receiving OTLP metrics.
+
+Do not create unnecessary dashboards, log groups, or trace resources.
+
+Explain whether the CloudWatch GenAI Observability / Coding Agent Insights dashboard is provisioned automatically by AWS or needs separate configuration.
+
+3. OpenShift integration requirements
+
+The Terraform infrastructure must support the following OpenShift configuration.
+
+The gateway will consume a Kubernetes/OpenShift Secret containing:
+
+CW_API_KEY
+
+The key will be used as:
+
+Authorization: Bearer ${CW_API_KEY}
+
+The destination configuration is conceptually:
+
+yaml
+telemetry:
+  forward_to:
+    - url: https://monitoring.eu-west-1.amazonaws.com
+      headers:
+        Authorization: "Bearer ${CW_API_KEY}"
+      metrics: true
+      logs: false
+      traces: false
+
+
+Do not provision OpenShift resources using Terraform unless explicitly justified.
+
+Instead:
+
+Explain how to retrieve the secret securely.
+Provide the corresponding oc command to create/update the OpenShift Secret.
+Explain how to inject it into the gateway Deployment.
+Explain how to rotate the key without exposing it in shell history or logs.
+4. Network requirements
+
+The OpenShift gateway uses Squid as an outbound proxy.
+
+Identify the required AWS endpoint:
+
+monitoring.eu-west-1.amazonaws.com
+
+Explain the minimum outbound HTTPS connectivity required.
+
+Do not add Logs or X-Ray endpoints.
+
+5. Terraform project structure
+
+Generate a complete, modular Terraform project with this structure:
+
+text
+terraform/
+├── versions.tf
+├── providers.tf
+├── variables.tf
+├── main.tf
+├── iam.tf
+├── secrets.tf
+├── outputs.tf
+├── terraform.tfvars.example
+└── README.md
+
+
+Use:
+
+Terraform 1.x.
+AWS provider.
+Variables for region, resource names, and configuration.
+Descriptive resource names.
+Consistent tags.
+Secure defaults.
+Reusable and maintainable code.
+6. Security requirements
+
+Follow AWS security best practices:
+
+Least privilege IAM.
+No hardcoded credentials.
+No API key values in Terraform outputs.
+No secrets committed to Git.
+Secure Terraform state storage.
+KMS encryption where appropriate.
+API key expiration of 90 days.
+Documented key rotation procedure.
+
+Explicitly identify any Terraform state exposure risks.
+
+7. Validation and testing
+
+Provide a step-by-step validation procedure:
+
+Verify the IAM user and permissions.
+Verify API key creation.
+Verify secret storage.
+Retrieve the secret securely.
+Test the endpoint using curl from AWS CloudShell.
+Confirm HTTP 200 response.
+Explain how to validate metric ingestion in CloudWatch.
+Explain how to verify that metrics become available in Query Studio using PromQL.
+
+Use this test request:
+
+bash
+curl -i -X POST \
+  "https://monitoring.eu-west-1.amazonaws.com/v1/metrics" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <API_KEY_SECRET>" \
+  -d '{"resourceMetrics":[]}'
+
+
+Clearly explain what a successful response means and what it does not validate (particularly the OpenShift/Squid network path).
+
+8. Expected deliverables
+
+I expect:
+
+Complete Terraform source code for every file.
+Explanation of every AWS resource.
+Explanation of IAM permissions.
+Exact Terraform deployment commands.
+API key creation procedure.
+Secrets Manager integration procedure.
+OpenShift Secret integration commands.
+API key rotation procedure.
+Testing and troubleshooting instructions.
+9. Important technical constraints
+
+Before generating the code:
+
+Verify the current AWS documentation for IAM service-specific credentials.
+Verify whether CloudWatch Metrics API keys can actually be provisioned through Terraform.
+Verify the exact IAM service identifier.
+Verify the relevant AWS-managed IAM policy names.
+Do not confuse CloudWatch Metrics API keys with CloudWatch Logs API keys or X-Ray API keys.
+Do not invent Terraform resources, AWS APIs, IAM actions, or configuration options.
+Clearly distinguish verified functionality from assumptions or unsupported functionality.
+
+If a requirement cannot be implemented safely or natively with Terraform, explain why and propose the smallest practical alternative.
+
+The final result must be deployable, secure, maintainable, and strictly limited to CloudWatch Metrics telemetry.
